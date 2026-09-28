@@ -36,11 +36,12 @@ unstable_module! {
     pub mod controller;
 }
 
+#[cfg(bt_controller = "btdm")]
 pub(crate) unsafe extern "C" fn malloc(size: u32) -> *mut crate::sys::c_types::c_void {
     unsafe { crate::compat::malloc::malloc(size as usize).cast() }
 }
 
-#[cfg(any(esp32, esp32c3, esp32s3))]
+#[cfg(any(bt_controller = "btdm", bt_controller = "npl"))]
 pub(crate) unsafe extern "C" fn malloc_internal(size: u32) -> *mut crate::sys::c_types::c_void {
     unsafe { crate::compat::malloc::malloc_internal(size as usize).cast() }
 }

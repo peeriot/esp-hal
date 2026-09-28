@@ -356,7 +356,7 @@ static G_OSI_FUNCS: ExtFuncsT = ExtFuncsT {
 
     esp_intr_alloc: Some(self::ble_os_adapter_chip_specific::esp_intr_alloc),
     esp_intr_free: Some(esp_intr_free),
-    malloc: Some(crate::ble::malloc),
+    malloc: Some(crate::ble::malloc_internal),
     free: Some(crate::ble::free),
     #[cfg(esp32c2)]
     hal_uart_start_tx: None,
@@ -1039,7 +1039,8 @@ unsafe extern "C" fn ble_npl_event_init(
 
     if unsafe { (*event).dummy } == 0 {
         unsafe {
-            let evt = crate::compat::malloc::calloc(1, core::mem::size_of::<Event>()) as *mut Event;
+            let evt = crate::compat::malloc::calloc_internal(1, core::mem::size_of::<Event>())
+                as *mut Event;
 
             (*evt).event_fn_ptr = func;
             (*evt).ev_arg_ptr = arg;
@@ -1214,7 +1215,8 @@ unsafe extern "C" fn ble_npl_callout_init(
 
         unsafe {
             let new_callout =
-                crate::compat::malloc::calloc(1, core::mem::size_of::<Callout>()) as *mut Callout;
+                crate::compat::malloc::calloc_internal(1, core::mem::size_of::<Callout>())
+                    as *mut Callout;
             (*new_callout).eventq = eventq;
             ble_npl_event_init(addr_of_mut!((*new_callout).events), func, args);
             (*callout).dummy = new_callout as i32;
@@ -1570,11 +1572,11 @@ pub(crate) fn ble_deinit() {
 #[cfg(esp32c2)]
 fn os_msys_buf_alloc() -> bool {
     unsafe {
-        OS_MSYS_INIT_1_DATA = crate::compat::malloc::calloc(
+        OS_MSYS_INIT_1_DATA = crate::compat::malloc::calloc_internal(
             1,
             core::mem::size_of::<OsMembufT>() * SYSINIT_MSYS_1_MEMPOOL_SIZE,
         ) as *mut u32;
-        OS_MSYS_INIT_2_DATA = crate::compat::malloc::calloc(
+        OS_MSYS_INIT_2_DATA = crate::compat::malloc::calloc_internal(
             1,
             core::mem::size_of::<OsMembufT>() * SYSINIT_MSYS_2_MEMPOOL_SIZE,
         ) as *mut u32;
