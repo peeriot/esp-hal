@@ -728,10 +728,7 @@ unsafe extern "C" fn ble_npl_callout_get_ticks(callout: *const ble_npl_callout) 
 
 #[cfg_attr(feature = "ble-host-npl", unsafe(no_mangle))]
 unsafe extern "C" fn ble_npl_callout_is_active(callout: *const ble_npl_callout) -> bool {
-    debug!(
-        "Missing real implementation: ble_npl_callout_is_active {:?}",
-        callout
-    );
+    trace!("ble_npl_callout_is_active {:?}", callout);
 
     assert!(unsafe { (*callout).dummy != 0 });
 
