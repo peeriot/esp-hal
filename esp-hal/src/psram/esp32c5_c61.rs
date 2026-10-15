@@ -133,8 +133,7 @@ impl Default for PsramConfig {
 /// Initialize PSRAM to be used for data.
 #[procmacros::ram]
 pub(crate) fn init_psram(config: &mut PsramConfig) -> bool {
-    quad::psram_init(config);
-    true
+    quad::psram_init(config)
 }
 
 #[procmacros::ram]

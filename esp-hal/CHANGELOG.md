@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- C5, C61: PSRAM auto-detection no longer maps a phantom 2 MB of PSRAM on chips without any, which corrupted the heap
 
 ### Removed
 

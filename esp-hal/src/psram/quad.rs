@@ -19,6 +19,10 @@ const PSRAM_QUAD_FAST_READ_QUAD: u32 = 0xEB;
 const PSRAM_QUAD_WRITE_QUAD: u32 = 0x38;
 const PSRAM_QUAD_FAST_READ_QUAD_DUMMY: u32 = 6;
 
+/// The Known Good Die byte of the read ID, and the value a working die returns.
+const PSRAM_ID_KGD_SHIFT: u64 = 8;
+const PSRAM_ID_KGD: u64 = 0x5d;
+
 #[derive(PartialEq)]
 #[allow(unused)]
 pub(super) enum CommandMode {
@@ -36,8 +40,9 @@ pub(super) enum MspiTimingSpeedMode {
     MspiTimingSpeedModeNormalPerf,
 }
 
+/// Returns `false`, leaving PSRAM unconfigured, if auto-detection finds no chip.
 #[ram]
-pub(crate) fn psram_init(config: &mut super::PsramConfig) {
+pub(crate) fn psram_init(config: &mut super::PsramConfig) -> bool {
     psram_gpio_config();
     psram_set_cs_timing();
 
@@ -63,12 +68,17 @@ pub(crate) fn psram_init(config: &mut super::PsramConfig) {
             false,
         );
 
-        if dev_id & u32::MAX as u64 == 0xffffff {
+        // With no chip on the bus the ID reads back as all ones. Like esp-idf,
+        // accept only an ID whose Known Good Die byte says the die passed test.
+        if (dev_id >> PSRAM_ID_KGD_SHIFT) & 0xff != PSRAM_ID_KGD {
             warn!(
                 "Unknown PSRAM chip ID: {:x}. PSRAM chip not found or not supported. Check if ESP_HAL_CONFIG_PSRAM_MODE is configured correctly.",
                 dev_id
             );
-            return;
+            // Flash shares the MSPI clocks slowed for the ID read; give it its
+            // speed back.
+            mspi_timing_enter_high_speed_mode(config);
+            return false;
         }
 
         info!("Detected PSRAM chip id = {:x}", dev_id);
@@ -104,6 +114,8 @@ pub(crate) fn psram_init(config: &mut super::PsramConfig) {
     // Back to the high speed mode. Flash/PSRAM clocks are set to the clock that
     // user selected. SPI0/1 registers are all set correctly
     mspi_timing_enter_high_speed_mode(config);
+
+    true
 }
 
 unsafe extern "C" {
