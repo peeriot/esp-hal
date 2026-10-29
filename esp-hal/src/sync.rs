@@ -47,7 +47,7 @@ impl RawLock for PriorityLock {
             return unsafe { SingleCoreInterruptLock.exit(token) };
         }
         assert!(Self::current_priority() <= self.0);
-        // Ensure no preceeding memory accesses are reordered to after interrupts are
+        // Ensure no preceding memory accesses are reordered to after interrupts are
         // enabled.
         compiler_fence(Ordering::SeqCst);
 
@@ -65,7 +65,7 @@ pub struct RawPriorityLimitedMutex {
 }
 
 impl RawPriorityLimitedMutex {
-    /// Create a new lock that is accessible at or below the given `priority`.
+    /// Creates a new lock that is accessible at or below the given `priority`.
     pub const fn new(priority: Priority) -> Self {
         Self {
             inner: GenericRawMutex::new(PriorityLock(RunLevel::Interrupt(

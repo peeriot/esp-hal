@@ -7,31 +7,12 @@
 
 crate::unstable_module! {
     pub mod clocks;
+    pub mod trng;
 }
 pub(crate) mod cpu_control;
 pub(crate) mod regi2c;
 
 pub(crate) use esp32s31 as pac;
-
-#[cfg(i2s_driver_supported)]
-#[cfg_attr(not(feature = "unstable"), allow(unused))]
-pub(crate) fn i2s_sclk_frequency() -> u32 {
-    clocks::pll_f160m_frequency()
-}
-
-pub(crate) fn enable_branch_predictor() {
-    // Enable branch predictor.
-    // Note that the branch predictor will start cache requests and needs to be
-    // disabled when the cache is disabled.
-    // MHCR: CSR 0x7c1 — sourced from SOC_BRANCH_PREDICTOR_SUPPORTED in
-    // esp-idf/components/soc/esp32s31/include/soc/soc_caps.h
-    const MHCR_RS: u32 = 1 << 4; // R/W, address return stack set bit
-    const MHCR_BFE: u32 = 1 << 5; // R/W, allow predictive jump set bit
-    const MHCR_BTB: u32 = 1 << 12; // R/W, branch target prediction enable bit
-    unsafe {
-        core::arch::asm!("csrrs x0, 0x7c1, {0}", in(reg) MHCR_RS | MHCR_BFE | MHCR_BTB);
-    }
-}
 
 #[cfg(feature = "rt")]
 pub(crate) fn riscv_preinit() {}
@@ -71,6 +52,9 @@ pub(crate) fn pre_init() {
     systimer.modify(|_, w| w.rst_en().set_bit());
     systimer.modify(|_, w| w.rst_en().clear_bit());
     systimer.modify(|_, w| w.clk_en().set_bit());
+
+    // Mirrors ESP-IDF's `init_rng`, see <https://github.com/espressif/esp-idf/blob/8d7d8aef588/components/esp_hw_support/hw_random.c#L114-L120>
+    trng::rng_ll_enable();
 }
 
 /// Opens LP/HP peripheral PMS regions for all security modes.
@@ -97,7 +81,7 @@ fn write_pms_ctrl_range(base: usize, start: usize, end: usize) {
 
 const CACHE_MAP_L1_DCACHE: u32 = 1 << 4;
 
-/// Write back a specific range of data in the cache.
+/// Writes back a specific range of data in the cache.
 #[doc(hidden)]
 #[crate::ram]
 pub unsafe fn cache_writeback_addr(addr: u32, size: u32) {

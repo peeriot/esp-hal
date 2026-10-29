@@ -227,7 +227,7 @@ impl FunctionMap {
     /// Returns the signal associated with the nth alternate function.
     ///
     /// Note that not all alternate functions are defined. The number of the
-    /// GPIO function is available separately. Not all alternate function have
+    /// GPIO function is available separately. Not all alternate functions have
     /// IO signals.
     pub fn get(&self, af: usize) -> Option<&str> {
         match af {
@@ -470,9 +470,9 @@ pub(crate) fn generate_gpios(
                 af: Option<&TokenStream>,
                 lp_groups: Option<&TokenStream>,
             ) {
-                // Split "NAMEnumber" format fragments into the NAME and the number. The function
-                // returns `None` if the input string is not in this format. The NAME part can be
-                // empty (i.e. this function can return `Some("", number)`).
+                // Split `name` + `number` fragments (e.g. `UART0`) into the name and the number.
+                // The function returns `None` if the input string is not in this format. The name
+                // part can be empty (i.e. this function can return `Some("", number)`).
                 fn split_signal_with_number(fragment: &str) -> Option<(&str, usize)> {
                     // Find the first character that is not a letter.
                     let Some(breakpoint) = fragment
@@ -677,6 +677,7 @@ pub(crate) fn generate_gpios(
     let lp_functions_enum = render_lp_functions(gpio);
 
     let gpio_for_signal = render_gpio_for_signal(gpio);
+    let gpio_soft_isolate = render_gpio_soft_isolate(gpio);
 
     quote! {
         /// This macro can be used to generate code for each `GPIOn` instance.
@@ -789,6 +790,8 @@ pub(crate) fn generate_gpios(
 
         #gpio_for_signal
 
+        #gpio_soft_isolate
+
         /// Defines the `InputSignal` and `OutputSignal` enums.
         ///
         /// This macro is intended to be called in esp-hal only.
@@ -835,6 +838,61 @@ pub(crate) fn generate_gpios(
                 #io_mux_accessor
             };
         }
+    }
+}
+
+/// Lists the digital pads that sleep entry isolates when `need_soft_isolate_during_pd` is set.
+///
+/// The list is separate from `for_each_gpio`: it contains only the pads that software may
+/// disconnect. Low-power pads keep their own supply, and flash or PSRAM pads must keep the memory
+/// interface.
+fn render_gpio_soft_isolate(gpio: &super::GpioProperties) -> TokenStream {
+    if !gpio.need_soft_isolate_during_pd {
+        return quote! {};
+    }
+
+    let pins = gpio
+        .pins_and_signals
+        .pins
+        .iter()
+        .filter(|pin| {
+            let has_lp = (0..LowPowerMap::COUNT).any(|af| pin.lp.get(af).is_some());
+            let memory_interface = pin.limitations.iter().any(|limitation| {
+                matches!(
+                    limitation,
+                    PinLimitation::SpiFlash
+                        | PinLimitation::OctalFlash
+                        | PinLimitation::SpiPsram
+                        | PinLimitation::OctalPsram
+                )
+            });
+            !has_lp && !memory_interface
+        })
+        .map(|pin| number(pin.pin))
+        .collect::<Vec<_>>();
+
+    let for_each = generate_for_each_macro("gpio_soft_isolate", &[("all", &pins)]);
+
+    quote! {
+        /// This macro can be used to generate code for each digital GPIO that deep-sleep entry
+        /// isolates when `gpio.need_soft_isolate_during_pd` is set.
+        ///
+        /// For an explanation on the general syntax, as well as usage of individual/repeated
+        /// matchers, refer to [the crate-level documentation][crate#for_each-macros].
+        ///
+        /// The list excludes low-power pads and pads that interface with flash or PSRAM. Isolating
+        /// a memory-interface pad cuts instruction fetch.
+        ///
+        /// This macro has one option for its "Individual matcher" case:
+        ///
+        /// Syntax: `($n:literal)`
+        ///
+        /// Macro fragments:
+        ///
+        /// - `$n`: the number of the GPIO. For `GPIO8`, `$n` is 8.
+        ///
+        /// Example data: `(8)`
+        #for_each
     }
 }
 

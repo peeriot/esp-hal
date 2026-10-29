@@ -31,7 +31,7 @@ mod tests {
         let mut p = esp_hal::init(esp_hal::Config::default());
 
         let timg0: TimerGroup<'_, _> = TimerGroup::new(p.TIMG0);
-        esp_rtos::start(timg0.timer0, p.FROM_CPU_INTR0);
+        esp_rtos::start(timg0.timer0);
 
         {
             let _connector = BleConnector::new(p.BT.reborrow(), Default::default()).unwrap();
@@ -57,7 +57,7 @@ mod tests {
     #[test]
     fn test_controller_comms(p: Peripherals) {
         let timg0: TimerGroup<'_, _> = TimerGroup::new(p.TIMG0);
-        esp_rtos::start(timg0.timer0, p.FROM_CPU_INTR0);
+        esp_rtos::start(timg0.timer0);
 
         let mut connector = BleConnector::new(p.BT, Default::default()).unwrap();
 
@@ -106,7 +106,7 @@ mod tests {
     #[test]
     fn test_dropping_controller_during_reset(p: Peripherals) {
         let timg0: TimerGroup<'_, _> = TimerGroup::new(p.TIMG0);
-        esp_rtos::start(timg0.timer0, p.FROM_CPU_INTR0);
+        esp_rtos::start(timg0.timer0);
 
         let mut connector = BleConnector::new(p.BT, Default::default()).unwrap();
 
@@ -134,14 +134,14 @@ mod tests {
     #[test]
     async fn test_trouble_starts_advertising(p: Peripherals) {
         let timg0: TimerGroup<'_, _> = TimerGroup::new(p.TIMG0);
-        esp_rtos::start(timg0.timer0, p.FROM_CPU_INTR0);
+        esp_rtos::start(timg0.timer0);
 
         let connector = BleConnector::new(p.BT, Default::default()).unwrap();
         let controller: ExternalController<_, 1> = ExternalController::new(connector);
 
         let address: Address = Address::random([0xff, 0x8f, 0x1a, 0x05, 0xe4, 0xff]);
 
-        let mut resources: HostResources<_, DefaultPacketPool, 1, 1> = HostResources::new();
+        let mut resources: HostResources<DefaultPacketPool, 1, 1> = HostResources::new();
         let stack = trouble_host::new(controller, &mut resources)
             .set_random_address(address)
             .build();

@@ -167,7 +167,6 @@ impl RunQueue {
         let priority_n = priority.get();
 
         ready_task.set_state(TaskState::Ready);
-        #[cfg(feature = "esp-radio")]
         {
             let mut ready_task = ready_task;
             if let Some(mut containing_queue) =
@@ -244,8 +243,15 @@ impl RunQueue {
         }
     }
 
+    /// Removes the highest priority task that the current CPU can run.
+    ///
+    /// `other_cpu_task` is the current task of the other CPU. The other CPU still runs on its
+    /// stack, even if the task is ready again, so this function does not return it.
     #[esp_hal::ram]
-    pub(crate) fn pop(&mut self) -> Option<TaskPtr> {
+    pub(crate) fn pop(
+        &mut self,
+        #[cfg(multi_core)] other_cpu_task: *const crate::task::Task,
+    ) -> Option<TaskPtr> {
         let current_prio = self.ready_priority.ready();
         trace!("pop - from level: {}", current_prio);
 
@@ -265,7 +271,9 @@ impl RunQueue {
                 let mut current_prio = current_prio;
                 let mut popped;
                 loop {
-                    popped = self.ready_tasks[current_prio].pop_if(|t| t.pinned_to != Some(other));
+                    popped = self.ready_tasks[current_prio].pop_if(|t| {
+                        t.pinned_to != Some(other) && !core::ptr::eq(t, other_cpu_task)
+                    });
 
                     if popped.is_none() {
                         priority_level.unmark(current_prio);

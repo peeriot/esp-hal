@@ -2,7 +2,7 @@ use super::{Config, ConfigError, Driver, RegisterBlock, configure_clock};
 
 /// Sets the frequency of the I2C interface by calculating and applying the
 /// associated timings - corresponds to i2c_ll_cal_bus_clk and
-/// i2c_ll_set_bus_timing in ESP-IDF
+/// i2c_ll_set_bus_timing in ESP-IDF.
 pub(super) fn set_frequency(driver: &Driver<'_>, clock_config: &Config) -> Result<(), ConfigError> {
     let timeout = clock_config.timeout;
     let bus_freq = clock_config.frequency.as_hz();
@@ -21,7 +21,7 @@ pub(super) fn set_frequency(driver: &Driver<'_>, clock_config: &Config) -> Resul
     // SCL period. According to the TRM, we should always subtract 1 to SCL low
     // period
     let scl_low = scl_low - 1;
-    // Still according to the TRM, if filter is not enbled, we have to subtract 7,
+    // Still according to the TRM, if filter is not enabled, we have to subtract 7,
     // if SCL filter is enabled, we have to subtract:
     //   8 if SCL filter is between 0 and 2 (included)
     //   6 + SCL threshold if SCL filter is between 3 and 7 (included)

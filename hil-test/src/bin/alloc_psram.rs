@@ -1,11 +1,11 @@
 //! Allocator and PSRAM-related tests
 
-//% CHIP_FILTER(llff, tlsf): psram_driver_supported && !soc_has_flash
-//% CHIP_FILTER(llff_with_storage, tlsf_with_storage): psram_driver_supported && soc_has_flash
-//% ENV(llff, llff_with_storage): ESP_ALLOC_CONFIG_HEAP_ALGORITHM=LLFF
-//% ENV(tlsf, tlsf_with_storage): ESP_ALLOC_CONFIG_HEAP_ALGORITHM=TLSF
+//% CHIP_FILTER(llff, tlsf): psram_driver_supported
+//% ENV(llff): ESP_ALLOC_CONFIG_HEAP_ALGORITHM=LLFF
+//% ENV(tlsf): ESP_ALLOC_CONFIG_HEAP_ALGORITHM=TLSF
+// The default 64KB leaves nothing to reclaim, see the dcache_reclaimed tests below.
+//% ENV-IF(esp32s3): ESP_HAL_CONFIG_DATA_CACHE_SIZE=32KB
 //% FEATURES: unstable esp-alloc/nightly
-//% FEATURES(llff_with_storage, tlsf_with_storage): esp-storage
 
 #![no_std]
 #![no_main]
@@ -140,12 +140,96 @@ mod tests {
     }
 }
 
-#[cfg(feature = "esp-storage")]
+/// Only the ESP32-S3 can hand unused data cache to the allocator, and only as much of it
+/// as `ESP_HAL_CONFIG_DATA_CACHE_SIZE` leaves unused.
+#[cfg(feature = "esp32s3")]
 #[embedded_test::tests]
-mod storage_tests {
+mod dcache_reclaimed {
+    use esp_hal::{clock::CpuClock, ram};
+
+    #[init]
+    fn init() {
+        let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
+        let _p = esp_hal::init(config);
+
+        esp_alloc::heap_allocator!(#[ram(unstable(dcache_reclaimed))] size: 32 * 1024);
+    }
+
+    #[test]
+    fn reclaimed_dcache_is_usable() {
+        let mut vec = alloc::vec::Vec::with_capacity(16384);
+
+        for i in 0..16384 {
+            vec.push((i % 256) as u8);
+        }
+
+        for i in 0..16384 {
+            assert_eq!(vec[i], (i % 256) as u8);
+        }
+    }
+}
+
+#[cfg(multi_core)]
+#[embedded_test::tests]
+mod multi_core_tests {
+    use core::sync::atomic::{AtomicBool, Ordering};
+
+    use allocator_api2::boxed::Box;
+    use esp_alloc::ExternalMemory;
+    use esp_hal::{
+        clock::CpuClock,
+        peripherals::CPU_CTRL,
+        system::{CpuControl, Stack},
+        time::{Duration, Instant},
+    };
+    use hil_test::mk_static;
+
+    #[init]
+    fn init() -> CPU_CTRL<'static> {
+        let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
+        let p = esp_hal::init(config);
+        esp_alloc::psram_allocator!(p.PSRAM, esp_hal::psram);
+
+        p.CPU_CTRL
+    }
+
+    #[test]
+    fn test_other_core_writes_psram(cpu_ctrl: CPU_CTRL<'static>) {
+        const PATTERN: u32 = 0xA5C3_5A3C;
+        static WRITTEN: AtomicBool = AtomicBool::new(false);
+
+        let word = Box::into_raw(Box::new_in(0u32, ExternalMemory)) as usize;
+
+        let mut cpu_control = CpuControl::new(cpu_ctrl);
+        let stack = mk_static!(Stack<8192>, Stack::new());
+        let _guard = cpu_control
+            .start_app_core(stack, move || {
+                unsafe { (word as *mut u32).write_volatile(PATTERN) };
+                WRITTEN.store(true, Ordering::Release);
+                loop {}
+            })
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_millis(100);
+        while !WRITTEN.load(Ordering::Acquire) {
+            assert!(
+                Instant::now() < deadline,
+                "the other core did not finish its write"
+            );
+        }
+        assert_eq!(unsafe { (word as *const u32).read_volatile() }, PATTERN);
+    }
+}
+
+#[cfg(flash_driver_supported)]
+#[embedded_test::tests]
+mod flash_tests {
     use esp_bootloader_esp_idf::partitions;
-    use esp_hal::{clock::CpuClock, peripherals::FLASH};
-    use esp_storage::FlashStorage;
+    use esp_hal::{
+        clock::CpuClock,
+        flash::{Config, Flash},
+        peripherals::FLASH,
+    };
 
     struct Context<'a> {
         flash: FLASH<'a>,
@@ -161,8 +245,8 @@ mod storage_tests {
     }
 
     #[test]
-    fn test_with_accessing_flash_storage(ctx: Context<'static>) {
-        let mut flash = FlashStorage::new(ctx.flash);
+    fn test_with_accessing_flash(ctx: Context<'static>) {
+        let mut flash = Flash::new(ctx.flash, Config::default()).unwrap();
 
         let mut pt_mem = [0u8; partitions::PARTITION_TABLE_MAX_LEN];
         let pt = partitions::read_partition_table(&mut flash, &mut pt_mem).unwrap();
@@ -176,7 +260,7 @@ mod storage_tests {
         ))
         .unwrap()
         .unwrap()
-        .as_flash_region(&mut flash)
+        .as_auto_flash_region(&mut flash)
         .read(32, &mut app_desc)
         .unwrap();
 
@@ -191,14 +275,12 @@ mod storage_tests {
     }
 
     #[test]
-    fn test_spiram_is_reliable_when_using_esp_storage() {
+    fn test_spiram_is_reliable_when_writing_flash(ctx: Context<'static>) {
         // adapted from the reproducer in https://github.com/esp-rs/esp-hal/issues/3642
 
-        const NVS_PART_FLASH_ADDR: usize = 0x9000;
+        const NVS_PART_FLASH_ADDR: u32 = 0x9000;
 
-        #[repr(C, align(4))]
-        struct AlignedBuf<const N: usize>([u8; N]);
-
+        let mut flash = Flash::new(ctx.flash, Config::default()).unwrap();
         let rng = esp_hal::rng::Rng::new();
 
         for _ in 0..100 {
@@ -206,19 +288,92 @@ mod storage_tests {
             let mut heap_buf = alloc::vec![0u8; 1024];
             rng.read(&mut buf);
             heap_buf.copy_from_slice(&buf);
-            let mut flash_buf = AlignedBuf([0; 4096]);
-            unsafe {
-                esp_storage::ll::spiflash_write(
-                    NVS_PART_FLASH_ADDR as u32,
-                    flash_buf.0.as_mut_ptr() as *const u32,
-                    1024,
-                )
-                .unwrap();
-            }
+            let flash_buf = [0u32; 256];
+            // SAFETY: the NVS partition is not mapped.
+            unsafe { flash.write(NVS_PART_FLASH_ADDR, &flash_buf) }.unwrap();
 
             for i in 0..1024 {
                 assert_eq!(buf[i], heap_buf[i], "buf != heap_buf at index {}", i);
             }
         }
+    }
+}
+
+/// PSRAM at the default 200 MHz with the MPLL at 400 MHz, and at 250 MHz with the MPLL at
+/// 500 MHz.
+#[cfg(feature = "esp32s31")]
+#[embedded_test::tests]
+mod mpll {
+    use esp_hal::{
+        clock::{
+            ClockConfig,
+            CpuClock,
+            ll::{MpllClkConfig, mpll_clk_frequency},
+        },
+        peripherals::{HP_SYS_CLKRST, LP_AON_CLK_RST},
+        psram::{Psram, PsramConfig, PsramTimingParams},
+    };
+
+    fn assert_mpll_programmed(expected_hz: u32) {
+        let div = unsafe { LP_AON_CLK_RST::steal() }
+            .register_block()
+            .mspi_div()
+            .read();
+        let fb_div = div.mspi_fb_div().bits() as u32;
+        let ref_div = div.mspi_ref_div().bits() as u32;
+        let mpll_hz = 40_000_000 * (fb_div + 1) / (ref_div + 1);
+
+        hil_test::assert_eq!(mpll_hz, expected_hz);
+        hil_test::assert_eq!(mpll_hz, mpll_clk_frequency());
+
+        let cal = unsafe { HP_SYS_CLKRST::steal() }
+            .register_block()
+            .ana_pll_ctrl0()
+            .read();
+        hil_test::assert!(
+            cal.mspi_cal_stop().bit_is_set(),
+            "esp-hal's MPLL calibration did not run"
+        );
+    }
+
+    fn assert_psram_holds_a_pattern(psram: &Psram) {
+        let (start, size) = psram.raw_parts();
+        hil_test::assert!(size > 0);
+
+        let words = size / 4;
+        let psram = unsafe { core::slice::from_raw_parts_mut(start as *mut u32, words) };
+
+        for (i, word) in psram.iter_mut().enumerate() {
+            *word = (i as u32).wrapping_mul(0x9E37_79B9);
+        }
+        for (i, word) in psram.iter().enumerate() {
+            hil_test::assert_eq!(*word, (i as u32).wrapping_mul(0x9E37_79B9));
+        }
+    }
+
+    #[test]
+    fn default_mpll_400_psram_200() {
+        let p = esp_hal::init(
+            esp_hal::Config::default().with_cpu_clock(ClockConfig::from(CpuClock::max())),
+        );
+        let psram = Psram::new(p.PSRAM, PsramConfig::default());
+
+        assert_mpll_programmed(400_000_000);
+        assert_psram_holds_a_pattern(&psram);
+    }
+
+    #[test]
+    fn mpll_500_psram_250() {
+        let mut clocks = ClockConfig::from(CpuClock::max());
+        clocks.mpll_clk = Some(MpllClkConfig::_500);
+        let p = esp_hal::init(esp_hal::Config::default().with_cpu_clock(clocks));
+        let config = PsramConfig {
+            timing: PsramTimingParams::MHZ_250,
+            ..Default::default()
+        };
+        let psram = Psram::new(p.PSRAM, config);
+
+        assert_mpll_programmed(500_000_000);
+        assert_psram_holds_a_pattern(&psram);
     }
 }

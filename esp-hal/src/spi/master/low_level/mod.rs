@@ -151,7 +151,7 @@ pub trait QspiInstance: Instance {}
 pub struct Info {
     /// Pointer to the register block for this SPI instance.
     ///
-    /// Use [Self::register_block] to access the register block.
+    /// Used with [`Self::register_block`] to access the register block.
     pub register_block: *const RegisterBlock,
 
     /// The system peripheral marker.
@@ -169,7 +169,7 @@ pub struct Info {
     pub sio_inputs: &'static [InputSignal],
     pub sio_outputs: &'static [OutputSignal],
 
-    /// Clock tree instance for this SPI peripheral.
+    /// Clocks tree instance for this SPI peripheral.
     pub clock_instance: crate::soc::clocks::SpiInstance,
 }
 
@@ -212,7 +212,7 @@ impl Driver {
         self.update();
     }
 
-    /// Initialize for full-duplex 1 bit mode
+    /// Initializes for full-duplex 1 bit mode.
     pub(super) fn init(&self) {
         version::enable_peripheral_clock(self);
 
@@ -252,19 +252,19 @@ impl Driver {
         version::init_spi_data_mode(self, cmd_mode, address_mode, data_mode)
     }
 
-    /// Enable or disable listening for the given interrupts.
+    /// Enables or disables listening for the given interrupts.
     #[cfg_attr(not(feature = "unstable"), allow(dead_code))]
     pub(super) fn enable_listen(&self, interrupts: EnumSet<SpiInterrupt>, enable: bool) {
         version::enable_listen(self, interrupts, enable);
     }
 
-    /// Gets asserted interrupts
+    /// Returns the asserted interrupts.
     #[cfg_attr(not(feature = "unstable"), allow(dead_code))]
     pub(super) fn interrupts(&self) -> EnumSet<SpiInterrupt> {
         version::interrupts(self)
     }
 
-    /// Resets asserted interrupts
+    /// Resets asserted interrupts.
     pub(super) fn clear_interrupts(&self, interrupts: EnumSet<SpiInterrupt>) {
         version::clear_interrupts(self, interrupts);
     }
@@ -357,7 +357,7 @@ impl Driver {
         }
     }
 
-    /// Write bytes to SPI.
+    /// Writes bytes to SPI.
     #[cfg_attr(place_spi_master_driver_in_ram, ram)]
     pub(super) fn write_one(&self, words: &[u8]) -> Result<(), Error> {
         if words.len() > FIFO_SIZE {
@@ -369,7 +369,7 @@ impl Driver {
         Ok(())
     }
 
-    /// Write bytes to SPI.
+    /// Writes bytes to SPI.
     #[cfg_attr(place_spi_master_driver_in_ram, ram)]
     pub(super) fn write(&self, words: &[u8]) -> Result<(), Error> {
         for chunk in words.chunks(FIFO_SIZE) {
@@ -379,21 +379,21 @@ impl Driver {
         Ok(())
     }
 
-    /// Write bytes to SPI.
+    /// Writes bytes to SPI.
     #[cfg_attr(place_spi_master_driver_in_ram, ram)]
     pub(super) async fn write_async(&self, words: &[u8]) -> Result<(), Error> {
         for chunk in words.chunks(FIFO_SIZE) {
             self.write_one(chunk)?;
-            self.flush_async().await;
+            self.flush_async_or_abort().await;
         }
         Ok(())
     }
 
-    /// Read bytes from SPI.
+    /// Reads bytes from SPI.
     ///
-    /// Sends out a stuffing byte for every byte to read. This function doesn't
-    /// perform flushing. If you want to read the response to something you
-    /// have written before, consider using [`Self::transfer`] instead.
+    /// Sends out a stuffing byte for every byte to read. Does not perform
+    /// flushing. To read the response to a prior write, use [`Self::transfer`]
+    /// instead.
     #[cfg_attr(place_spi_master_driver_in_ram, ram)]
     pub(super) fn read(&self, words: &mut [u8]) -> Result<(), Error> {
         let empty_array = [EMPTY_WRITE_PAD; FIFO_SIZE];
@@ -406,29 +406,27 @@ impl Driver {
         Ok(())
     }
 
-    /// Read bytes from SPI.
+    /// Reads bytes from SPI.
     ///
-    /// Sends out a stuffing byte for every byte to read. If you want to read
-    /// the response to something you have written before, consider using
-    /// [`Self::transfer`] instead.
+    /// Sends out a stuffing byte for every byte to read. To read the response to a
+    /// prior write, use [`Self::transfer`] instead
     #[cfg_attr(place_spi_master_driver_in_ram, ram)]
     pub(super) async fn read_async(&self, words: &mut [u8]) -> Result<(), Error> {
         let empty_array = [EMPTY_WRITE_PAD; FIFO_SIZE];
 
         for chunk in words.chunks_mut(FIFO_SIZE) {
             self.write_one(&empty_array[0..chunk.len()])?;
-            self.flush_async().await;
+            self.flush_async_or_abort().await;
             self.read_from_fifo(chunk)?;
         }
         Ok(())
     }
 
-    /// Read received bytes from SPI FIFO.
+    /// Reads received bytes from SPI FIFO.
     ///
-    /// Copies the contents of the SPI receive FIFO into `words`. This function
-    /// doesn't perform any data transfer. If you want to read the response to
-    /// something you have written before, consider using [`Self::transfer`]
-    /// instead.
+    /// Copies the contents of the SPI receive FIFO into `words`. Does not perform
+    /// any data transfer. To read the response to a prior write, use
+    /// [`Self::transfer`] instead
     #[cfg_attr(place_spi_master_driver_in_ram, ram)]
     pub(super) fn read_from_fifo(&self, words: &mut [u8]) -> Result<(), Error> {
         if words.len() > FIFO_SIZE {
@@ -454,6 +452,28 @@ impl Driver {
     #[cfg_attr(place_spi_master_driver_in_ram, ram)]
     pub(super) fn flush_async(&self) -> impl Future<Output = ()> {
         SpiFuture { driver: self }
+    }
+
+    /// Waits for the current transfer to finish.
+    ///
+    /// If the future is dropped, the transfer is cut short, and the drop blocks for a short while
+    /// until the peripheral is idle.
+    ///
+    /// Await this directly after starting a CPU-driven chunk, with no `.await` in between. A
+    /// future can only be dropped while it is suspended, and the guard is created in the first
+    /// poll, before this future can first suspend. The chunk is therefore covered from the
+    /// moment it starts.
+    ///
+    /// Use [`Self::flush_async`] to wait for a transfer that the caller did not start, e.g. the
+    /// tail of an earlier operation. Cancelling that wait must not abort the other operation.
+    #[cfg_attr(place_spi_master_driver_in_ram, ram)]
+    async fn flush_async_or_abort(&self) {
+        let cancel_on_drop = DropGuard::new((), |_| {
+            self.abort_transfer();
+            let _ = self.flush();
+        });
+        self.flush_async().await;
+        cancel_on_drop.defuse();
     }
 
     // Check if the bus is busy and if it is wait for it to be idle
@@ -678,14 +698,7 @@ impl Driver {
             self.prepare_half_duplex_chunk(first, last);
             self.configure_datalen(chunk.len(), 0);
             self.start_operation();
-
-            let cancel_on_drop = DropGuard::new((), |_| {
-                self.abort_transfer();
-                let _ = self.flush();
-            });
-            self.flush_async().await;
-            cancel_on_drop.defuse();
-
+            self.flush_async_or_abort().await;
             self.read_from_fifo(chunk)?;
             first = false;
         }
@@ -747,13 +760,7 @@ impl Driver {
         if buffer.is_empty() {
             self.prepare_half_duplex_chunk(true, true);
             self.start_operation();
-
-            let cancel_on_drop = DropGuard::new((), |_| {
-                self.abort_transfer();
-                let _ = self.flush();
-            });
-            self.flush_async().await;
-            cancel_on_drop.defuse();
+            self.flush_async_or_abort().await;
         } else {
             let mut first = true;
             let mut chunks = buffer.chunks(FIFO_SIZE).peekable();
@@ -763,14 +770,7 @@ impl Driver {
                 self.configure_datalen(0, chunk.len());
                 self.fill_fifo(chunk);
                 self.start_operation();
-
-                let cancel_on_drop = DropGuard::new((), |_| {
-                    self.abort_transfer();
-                    let _ = self.flush();
-                });
-                self.flush_async().await;
-                cancel_on_drop.defuse();
-
+                self.flush_async_or_abort().await;
                 first = false;
             }
         }
@@ -780,17 +780,8 @@ impl Driver {
     #[cfg_attr(place_spi_master_driver_in_ram, ram)]
     pub(super) async fn transfer_in_place_async(&self, words: &mut [u8]) -> Result<(), Error> {
         for chunk in words.chunks_mut(FIFO_SIZE) {
-            // Cut the transfer short if the future is dropped. We'll block for a short
-            // while to ensure the peripheral is idle.
-            let cancel_on_drop = DropGuard::new((), |_| {
-                self.abort_transfer();
-                let _ = self.flush();
-            });
-            let res = self.write_one(chunk);
-            self.flush_async().await;
-            cancel_on_drop.defuse();
-            res?;
-
+            self.write_one(chunk)?;
+            self.flush_async_or_abort().await;
             self.read_from_fifo(chunk)?;
         }
 
@@ -823,7 +814,7 @@ impl Driver {
                 self.write_one(&write[write_from..][..write_inc])?;
             }
 
-            self.flush_async().await;
+            self.flush_async_or_abort().await;
 
             if read_inc > 0 {
                 self.read_from_fifo(&mut read[read_from..][..read_inc])?;

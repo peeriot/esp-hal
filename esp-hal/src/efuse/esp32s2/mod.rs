@@ -5,12 +5,12 @@ mod fields;
 #[instability::unstable]
 pub use fields::*;
 
-/// Selects which ADC we are interested in the efuse calibration data for
+/// Selects which ADC the eFuse calibration data applies to.
 #[instability::unstable]
 pub enum AdcCalibUnit {
-    /// Select efuse calibration data for ADC1
+    /// Selects efuse calibration data for ADC1.
     ADC1,
-    /// Select efuse calibration data for ADC2
+    /// Selects efuse calibration data for ADC2.
     ADC2,
 }
 
@@ -282,14 +282,6 @@ const RTC_CALIB_MAP: [RtcCalibEntry; 33] = [
     },
 ];
 
-fn signed_bit_to_int(number: u32, len: u32) -> i32 {
-    if number >> (len - 1) != 0 {
-        -((number ^ (1 << (len - 1))) as i32)
-    } else {
-        number as i32
-    }
-}
-
 fn rtc_calib_tag(version: u8, unit: u8, atten: Attenuation, param: RtcCalibParam) -> Option<u8> {
     let atten = atten as u8;
     let offset = match (version, param) {
@@ -300,6 +292,17 @@ fn rtc_calib_tag(version: u8, unit: u8, atten: Attenuation, param: RtcCalibParam
         _ => return None,
     };
     Some(offset + unit * 4 + atten)
+}
+
+// Reads the RTC bandgap trim from eFuse block 2.
+//
+// See `efuse_ll_get_ocode` in
+// <https://github.com/espressif/esp-idf/blob/v6.1/components/hal/esp32s2/include/hal/efuse_ll.h>
+pub(crate) fn ocode() -> u8 {
+    const OCODE1: crate::efuse::EfuseField = crate::efuse::EfuseField::new(2, 4, 128, 4);
+    const OCODE2: crate::efuse::EfuseField = crate::efuse::EfuseField::new(2, 4, 144, 3);
+
+    (super::read_field_le::<u8>(OCODE2) << 4) + super::read_field_le::<u8>(OCODE1)
 }
 
 fn rtc_calib_parsed(tag: u8, skip_efuse: bool) -> i32 {
@@ -317,7 +320,7 @@ fn rtc_calib_parsed(tag: u8, skip_efuse: bool) -> i32 {
             entry.length as u32,
         );
         let bits = super::read_field_le::<u32>(field);
-        signed_bit_to_int(bits, entry.length as u32) * i32::from(entry.multiplier)
+        super::sign_magnitude(bits, entry.length as u32 - 1) * i32::from(entry.multiplier)
     };
     raw + i32::from(entry.base) + rtc_calib_parsed(entry.depends, skip_efuse)
 }
@@ -342,7 +345,7 @@ pub(crate) fn rtc_calib_reading_inner(
         .unwrap_or(0)
 }
 
-/// Get version of RTC calibration block
+/// Returns the version of RTC calibration block.
 ///
 /// See <https://github.com/espressif/esp-idf/blob/027613140/components/efuse/esp32s2/esp_efuse_rtc_table.c#L92>
 #[instability::unstable]
@@ -350,7 +353,7 @@ pub fn rtc_calib_version() -> u8 {
     super::read_field_le::<u8>(BLK_VERSION_MINOR)
 }
 
-/// Get ADC initial code for specified attenuation from efuse
+/// Returns the ADC initial code for specified attenuation from efuse.
 #[instability::unstable]
 pub fn rtc_calib_init_code(unit: AdcCalibUnit, atten: Attenuation) -> Option<u16> {
     if rtc_calib_version() != 2 {
@@ -359,18 +362,18 @@ pub fn rtc_calib_init_code(unit: AdcCalibUnit, atten: Attenuation) -> Option<u16
     Some(rtc_calib_reading(2, unit.index(), atten, RtcCalibParam::Vinit) as u16)
 }
 
-/// Get ADC reference point voltage for specified attenuation in millivolts
+/// Returns the ADC reference point voltage for specified attenuation in millivolts.
 #[instability::unstable]
-pub fn rtc_calib_cal_mv(_unit: AdcCalibUnit, atten: Attenuation) -> u16 {
-    match atten {
+pub fn rtc_calib_cal_mv(_unit: AdcCalibUnit, atten: Attenuation) -> Option<u16> {
+    Some(match atten {
         Attenuation::_0dB => 600,
         Attenuation::_2p5dB => 800,
         Attenuation::_6dB => 1000,
         Attenuation::_11dB => 2000,
-    }
+    })
 }
 
-/// Get ADC reference point digital code for specified attenuation
+/// Returns the ADC reference point digital code for specified attenuation.
 #[instability::unstable]
 pub fn rtc_calib_cal_code(unit: AdcCalibUnit, atten: Attenuation) -> Option<u16> {
     if rtc_calib_version() != 2 {
@@ -379,7 +382,7 @@ pub fn rtc_calib_cal_code(unit: AdcCalibUnit, atten: Attenuation) -> Option<u16>
     Some(rtc_calib_reading(2, unit.index(), atten, RtcCalibParam::Vhigh) as u16)
 }
 
-/// Get status of SPI boot encryption.
+/// Returns whether SPI boot encryption is enabled.
 #[instability::unstable]
 pub fn flash_encryption() -> bool {
     !super::read_field_le::<u8>(SPI_BOOT_CRYPT_CNT)
@@ -387,19 +390,19 @@ pub fn flash_encryption() -> bool {
         .is_multiple_of(2)
 }
 
-/// Get the multiplier for the timeout value of the RWDT STAGE 0 register.
+/// Returns the multiplier for the timeout value of the RWDT STAGE 0 register.
 #[instability::unstable]
 pub fn rwdt_multiplier() -> u8 {
     super::read_field_le::<u8>(WDT_DELAY_SEL)
 }
 
-/// Returns the major hardware revision
+/// Returns the major hardware revision.
 #[instability::unstable]
 pub fn major_chip_version() -> u8 {
     super::read_field_le(WAFER_VERSION_MAJOR)
 }
 
-/// Returns the minor hardware revision
+/// Returns the minor hardware revision.
 #[instability::unstable]
 pub fn minor_chip_version() -> u8 {
     super::read_field_le::<u8>(WAFER_VERSION_MINOR_HI) << 3

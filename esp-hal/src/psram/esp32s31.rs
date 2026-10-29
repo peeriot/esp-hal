@@ -16,7 +16,7 @@ pub struct PsramConfig {
     /// Size of PSRAM to map. Default: `AutoDetect` via MR2 density.
     pub size: PsramSize,
 
-    /// PSRAM timing parameters. Default: 250 MHz.
+    /// PSRAM timing parameters. Default: 200 MHz. 250 MHz needs the MPLL at 500 MHz.
     pub timing: PsramTimingParams,
     // TODO: ECC enable.
     // The MSPI0 controller has a ECC engine.
@@ -42,12 +42,12 @@ pub struct PsramTimingParams {
     /// MR4.wr_latency field value.
     pub mr4_wl: u8,
 
-    /// Read dummy length in bits for sync data reads (cache path).
+    /// Reads dummy length in bits for sync data reads (cache path).
     ///
     /// For `N` dummy bits, configure `reg_dummy_bits` to `N - 1`.
     pub rd_dummy_bits: u8,
 
-    /// Write dummy length in bits for sync data writes (cache path).
+    /// Writes dummy length in bits for sync data writes (cache path).
     ///
     /// For `N` dummy bits, configure `reg_dummy_bits` to `N - 1`.
     pub wr_dummy_bits: u8,
@@ -58,7 +58,7 @@ pub struct PsramTimingParams {
 
 impl Default for PsramTimingParams {
     fn default() -> Self {
-        Self::MHZ_250
+        Self::MHZ_200
     }
 }
 
@@ -119,7 +119,7 @@ impl PsramTimingParams {
     };
 }
 
-/// Initialize PSRAM.
+/// Initializes PSRAM.
 #[crate::ram]
 pub(crate) fn init_psram(config: &mut PsramConfig) -> bool {
     // Module clock + clock source

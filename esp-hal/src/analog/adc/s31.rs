@@ -10,7 +10,7 @@ use Interrupt::LP_ADC as InterruptSource;
 use portable_atomic::{AtomicU32, Ordering};
 use procmacros::handler;
 
-use super::{AdcCalScheme, AdcChannel, AdcConfig, AdcPin};
+use super::{AdcCalScheme, AdcChannel, AdcConfig, AdcPin, Error};
 use crate::{
     Async,
     Blocking,
@@ -55,7 +55,7 @@ const TRIGGER_MODE_SW: u8 = 2;
 /// Trigger disabled.
 const TRIGGER_MODE_OFF: u8 = 0;
 
-/// Power the SAR up by software, instead of leaving it to the FSM.
+/// Powers the SAR up by software, instead of leaving it to the FSM.
 const FORCE_XPD_SAR_PU: u8 = 3;
 
 /// Clock divider for the digital controller. The divider is `CLK_DIV_NUM + 1`.
@@ -67,7 +67,7 @@ const CLK_DIV_NUM: u8 = 4;
 /// Digital controller clock source select value for XTAL.
 const CLK_SRC_XTAL: u8 = 1;
 
-/// Enable the reference generator shared by both units.
+/// Enables the reference generator shared by both units.
 fn enable_refgen() {
     APB_SARADC::regs().ref_control().modify(|_, w| {
         w.rtc_xpd_refgen().set_bit();
@@ -76,38 +76,74 @@ fn enable_refgen() {
     });
 }
 
+// Powers both SAR units up.
+//
+// The power bits are shared, so both units come up together.
+fn power_on_sar_units() {
+    enable_refgen();
+
+    APB_SARADC::regs()
+        .ctrl0()
+        .modify(|_, w| unsafe { w.xpd_sar1_force().bits(FORCE_XPD_SAR_PU) });
+    APB_SARADC::regs()
+        .ctrl1()
+        .modify(|_, w| unsafe { w.xpd_sar2_force().bits(FORCE_XPD_SAR_PU) });
+}
+
 #[doc(hidden)]
 pub trait RegisterAccess {
-    /// Power the SAR up and put the unit into single-conversion mode.
-    fn enable();
+    /// Prepares the unit for a one-shot conversion.
+    fn prepare();
 
-    /// Program the single-entry pattern table with the given channel.
+    /// Programs the single-entry pattern table with the given channel.
     fn program_pattern(channel: u8);
 
-    /// Trigger one conversion.
+    /// Triggers one conversion.
     fn start_sample();
 
-    /// Check if sampling is done
+    /// Returns whether sampling is done.
     fn is_done() -> bool;
 
-    /// Read sample data
+    /// Reads sample data.
     fn read_data() -> u16;
 
-    /// Clear the done flag and stop triggering.
+    /// Clears the done flag and stops triggering.
     fn reset();
+
+    /// Starts one conversion on `channel`.
+    ///
+    /// The done flag does not have to be cleared first: [`Self::reset`] does that at the end of
+    /// every conversion, and once more while the driver is built.
+    fn start(channel: u8) {
+        Self::prepare();
+        Self::program_pattern(channel);
+        Self::start_sample();
+    }
+
+    /// Runs one blocking conversion on `channel`.
+    fn sample(channel: u8) -> u16 {
+        Self::start(channel);
+
+        while !Self::is_done() {}
+
+        let converted_value = Self::read_data();
+        Self::reset();
+        converted_value
+    }
 }
 
 #[cfg(adc_adc1)]
 impl RegisterAccess for crate::peripherals::ADC1<'_> {
-    fn enable() {
+    fn prepare() {
         APB_SARADC::regs()
             .ctrl2()
             .modify(|_, w| w.timer_en().clear_bit());
 
-        enable_refgen();
+        power_on_sar_units();
 
-        APB_SARADC::regs().ctrl0().modify(|_, w| unsafe {
-            w.xpd_sar1_force().bits(FORCE_XPD_SAR_PU);
+        // Only this unit's trigger mode is touched, so a driver for the other unit
+        // keeps its own state - `adc_oneshot_ll_enable` is per unit too.
+        APB_SARADC::regs().ctrl0().modify(|_, w| {
             w.sar1_continue_mode_en().clear_bit();
             w.sar1_trigger_stop().set_bit()
         });
@@ -167,15 +203,14 @@ impl RegisterAccess for crate::peripherals::ADC1<'_> {
 
 #[cfg(adc_adc2)]
 impl RegisterAccess for crate::peripherals::ADC2<'_> {
-    fn enable() {
+    fn prepare() {
         APB_SARADC::regs()
             .ctrl2()
             .modify(|_, w| w.timer_en().clear_bit());
 
-        enable_refgen();
+        power_on_sar_units();
 
-        APB_SARADC::regs().ctrl1().modify(|_, w| unsafe {
-            w.xpd_sar2_force().bits(FORCE_XPD_SAR_PU);
+        APB_SARADC::regs().ctrl1().modify(|_, w| {
             w.sar2_continue_mode_en().clear_bit();
             w.sar2_trigger_stop().set_bit()
         });
@@ -234,22 +269,32 @@ impl RegisterAccess for crate::peripherals::ADC2<'_> {
 /// Analog-to-Digital Converter peripheral driver.
 pub struct Adc<'d, ADC, Dm: crate::DriverMode> {
     _adc: ADC,
+    configured: [bool; NUM_ATTENS],
     active_channel: Option<u8>,
     _guard: GenericPeripheralGuard<{ Peripheral::ApbSarAdc as u8 }>,
     _phantom: PhantomData<(Dm, &'d mut ())>,
+}
+
+fn check_channel_configured(configured: &[bool; NUM_ATTENS], channel: u8) -> Result<(), Error> {
+    if configured[channel as usize] {
+        Ok(())
+    } else {
+        Err(Error::ChannelNotConfigured(channel))
+    }
 }
 
 impl<'d, ADCX> Adc<'d, ADCX, Blocking>
 where
     ADCX: RegisterAccess + 'd,
 {
-    /// Configure a given ADC instance using the provided configuration, and
-    /// initialize the ADC for use
+    /// Creates a new ADC instance with the given configuration.
     ///
     /// The ESP32-S31 SAR ADC has a single attenuation setting, so the
     /// attenuation given per pin has no effect.
-    pub fn new(adc_instance: ADCX, _config: AdcConfig<ADCX>) -> Self {
+    pub fn new(adc_instance: ADCX, config: AdcConfig<ADCX>) -> Result<Self, Error> {
         let guard = GenericPeripheralGuard::new();
+
+        let configured = config.attenuations.map(|attenuation| attenuation.is_some());
 
         // Select XTAL as the digital controller clock and divide it down.
         LP_PERI::regs().adc_ctrl().modify(|_, w| unsafe {
@@ -262,14 +307,16 @@ where
             .ctrl_date()
             .modify(|_, w| w.clk_en().set_bit());
 
-        ADCX::enable();
+        ADCX::prepare();
+        ADCX::reset();
 
-        Adc {
+        Ok(Adc {
             _adc: adc_instance,
+            configured,
             active_channel: None,
             _guard: guard,
             _phantom: PhantomData,
-        }
+        })
     }
 
     /// Reconfigures the ADC driver to operate in asynchronous mode.
@@ -282,62 +329,70 @@ where
 
         Adc {
             _adc: self._adc,
+            configured: self.configured,
             active_channel: self.active_channel,
             _guard: self._guard,
             _phantom: PhantomData,
         }
     }
 
-    /// Start and wait for a conversion on the specified pin and return the
-    /// result
+    /// Starts and waits for a conversion on the specified pin and returns the
+    /// result.
     ///
     /// The result is in the range 0..=[`FULL_SCALE`], and an input tied to
     /// ground reads about [`ZERO_DIFF_CODE`].
-    pub fn read_blocking<PIN, CS>(&mut self, pin: &mut AdcPin<PIN, ADCX, CS>) -> u16
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::ChannelNotConfigured`] if the channel was not configured in
+    /// [`AdcConfig`].
+    pub fn read_blocking<PIN, CS>(&mut self, pin: &mut AdcPin<PIN, ADCX, CS>) -> Result<u16, Error>
     where
         PIN: AdcChannel,
         CS: AdcCalScheme<ADCX>,
     {
-        ADCX::program_pattern(pin.pin.adc_channel());
-        ADCX::start_sample();
+        let channel = pin.pin.adc_channel();
+        check_channel_configured(&self.configured, channel)?;
 
-        while !ADCX::is_done() {}
-
-        let converted_value = ADCX::read_data();
-        ADCX::reset();
-
-        converted_value
+        Ok(ADCX::sample(channel))
     }
 
-    /// Request that the ADC begin a conversion on the specified pin
+    /// Requests that the ADC begin a conversion on the specified pin.
     ///
-    /// This method takes an [AdcPin](super::AdcPin) reference, as it is
+    /// Takes an [`AdcPin`](super::AdcPin) reference, as it is
     /// expected that the ADC will be able to sample whatever channel
     /// underlies the pin.
     ///
     /// The result is in the range 0..=[`FULL_SCALE`], and an input tied to
     /// ground reads about [`ZERO_DIFF_CODE`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::ChannelNotConfigured`] if the channel was not configured in
+    /// [`AdcConfig`].
     pub fn read_oneshot<PIN, CS>(
         &mut self,
         pin: &mut super::AdcPin<PIN, ADCX, CS>,
-    ) -> nb::Result<u16, ()>
+    ) -> nb::Result<u16, Error>
     where
         PIN: super::AdcChannel,
         CS: super::AdcCalScheme<ADCX>,
     {
+        let channel = pin.pin.adc_channel();
+        check_channel_configured(&self.configured, channel).map_err(nb::Error::Other)?;
+
         if let Some(active_channel) = self.active_channel {
             // There is conversion in progress:
             // - if it's for a different channel try again later
             // - if it's for the given channel, go ahead and check progress
-            if active_channel != pin.pin.adc_channel() {
+            if active_channel != channel {
                 return Err(nb::Error::WouldBlock);
             }
         } else {
             // If no conversions are in progress, start a new one for given channel
-            self.active_channel = Some(pin.pin.adc_channel());
+            self.active_channel = Some(channel);
 
-            ADCX::program_pattern(pin.pin.adc_channel());
-            ADCX::start_sample();
+            ADCX::start(channel);
         }
 
         if !ADCX::is_done() {
@@ -369,7 +424,7 @@ impl<'d, ADCX> Adc<'d, ADCX, Async>
 where
     ADCX: RegisterAccess + 'd,
 {
-    /// Create a new instance in [crate::Blocking] mode.
+    /// Reconfigures the ADC driver to operate in [`Blocking`] mode.
     pub fn into_blocking(self) -> Adc<'d, ADCX, Blocking> {
         if release_async_adc() {
             // Disable the ADC interrupt on all cores once the last async instance goes away.
@@ -379,35 +434,46 @@ where
         }
         Adc {
             _adc: self._adc,
+            configured: self.configured,
             active_channel: self.active_channel,
             _guard: self._guard,
             _phantom: PhantomData,
         }
     }
 
-    /// Start a conversion on the specified pin and wait for the result.
+    /// Starts a conversion on the specified pin and waits for the result.
     ///
-    /// This method takes an [AdcPin](super::AdcPin) reference, as it is
+    /// Takes an [`AdcPin`](super::AdcPin) reference, as it is
     /// expected that the ADC will be able to sample whatever channel
     /// underlies the pin.
     ///
     /// The result is in the range 0..=[`FULL_SCALE`], and an input tied to
     /// ground reads about [`ZERO_DIFF_CODE`].
-    pub async fn read_oneshot<PIN, CS>(&mut self, pin: &mut super::AdcPin<PIN, ADCX, CS>) -> u16
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::ChannelNotConfigured`] if the channel was not configured in
+    /// [`AdcConfig`].
+    pub async fn read_oneshot<PIN, CS>(
+        &mut self,
+        pin: &mut super::AdcPin<PIN, ADCX, CS>,
+    ) -> Result<u16, Error>
     where
         ADCX: Instance,
         PIN: super::AdcChannel,
         CS: super::AdcCalScheme<ADCX>,
     {
-        ADCX::program_pattern(pin.pin.adc_channel());
-        ADCX::start_sample();
+        let channel = pin.pin.adc_channel();
+        check_channel_configured(&self.configured, channel)?;
+
+        ADCX::start(channel);
 
         AdcFuture::<ADCX>::new(self).await;
 
         let converted_value = ADCX::read_data();
         ADCX::reset();
 
-        converted_value
+        Ok(converted_value)
     }
 }
 
@@ -441,18 +507,18 @@ fn handle_async<ADCX: Instance>(_instance: ADCX) {
     ADCX::unlisten();
 }
 
-/// Enable asynchronous access.
+/// Enables asynchronous access.
 pub trait Instance: crate::private::Sealed {
-    /// Enable the ADC interrupt
+    /// Enables the ADC interrupt.
     fn listen();
 
-    /// Disable the ADC interrupt
+    /// Disables the ADC interrupt.
     fn unlisten();
 
-    /// Clear the ADC interrupt
+    /// Clears the ADC interrupt.
     fn clear_interrupt();
 
-    /// Obtain the waker for the ADC interrupt
+    /// Obtains the waker for the ADC interrupt.
     fn waker() -> &'static AtomicWaker;
 }
 
