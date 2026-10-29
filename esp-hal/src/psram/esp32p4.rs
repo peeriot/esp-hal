@@ -14,14 +14,12 @@ mod oct_hex;
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[instability::unstable]
 pub enum PsramMode {
-    /// 16-line DDR, AP HEX PSRAM with MR8.x16 = 1. Default.
+    /// 16-line DDR. Default.
     #[default]
     Hex,
-    // TODO; selecting `Oct`
-    // requires the cache-side controller config (`mem_sdin_hex` /
-    // `mem_sdout_hex` bits) and chip MR8.x16 to flip together. Wire that
-    // path before exposing.
-    // Oct,
+
+    /// 8-line DDR.
+    Oct,
 }
 
 /// PSRAM configuration.
@@ -61,12 +59,12 @@ pub struct PsramTimingParams {
     /// MR4.wr_latency field value.
     pub mr4_wl: u8,
 
-    /// Read dummy length in bits for sync data reads (cache path).
+    /// Reads dummy length in bits for sync data reads (cache path).
     ///
     /// For `N` dummy bits, configure `reg_dummy_bits` to `N - 1`.
     pub rd_dummy_bits: u8,
 
-    /// Write dummy length in bits for sync data writes (cache path).
+    /// Writes dummy length in bits for sync data writes (cache path).
     ///
     /// For `N` dummy bits, configure `reg_dummy_bits` to `N - 1`.
     pub wr_dummy_bits: u8,
@@ -138,7 +136,7 @@ impl PsramTimingParams {
     };
 }
 
-/// Initialize PSRAM.
+/// Initializes PSRAM.
 #[crate::ram]
 pub(crate) fn init_psram(config: &mut PsramConfig) -> bool {
     psram_phy_ldo_init();
@@ -189,7 +187,7 @@ pub(crate) fn map_psram(config: PsramConfig) -> core::ops::Range<usize> {
     start..start + config.size.get()
 }
 
-/// Program the PMU external LDO regulators for the MSPI PHY
+/// Programs the PMU external LDO regulators for the MSPI PHY.
 fn psram_phy_ldo_init() {
     PMU::regs()
         .ext_ldo_p0_0p1a()

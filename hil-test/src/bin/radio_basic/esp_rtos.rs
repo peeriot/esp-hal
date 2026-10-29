@@ -7,27 +7,26 @@ mod tests {
     use esp_hal::{
         clock::CpuClock,
         interrupt::{Priority, software::SoftwareInterrupt},
-        peripherals::{FROM_CPU_INTR0, FROM_CPU_INTR2, TIMG0},
+        peripherals::{FROM_CPU_INTR2, TIMG0},
         time::{Duration, Instant},
         timer::timg::TimerGroup,
     };
     #[cfg(multi_core)]
-    use esp_hal::{
-        peripherals::{CPU_CTRL, FROM_CPU_INTR1},
-        system::Cpu,
-    };
+    use esp_hal::{peripherals::CPU_CTRL, system::Cpu};
     use esp_radio_rtos_driver::{
         self as preempt,
         queue::QueueHandle,
         semaphore::{SemaphoreHandle, SemaphoreKind},
     };
-    use esp_rtos::{CurrentThreadHandle, embassy::InterruptExecutor};
+    use esp_rtos::{
+        CurrentThreadHandle,
+        embassy::InterruptExecutor,
+        thread::{Stack as ThreadStack, ThreadSpawner},
+    };
     use portable_atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
-    use static_cell::StaticCell;
+    use static_cell::{ConstStaticCell, StaticCell};
 
     struct Context {
-        #[cfg(multi_core)]
-        sw_int1: FROM_CPU_INTR1<'static>,
         sw_int2: FROM_CPU_INTR2<'static>,
         #[cfg(multi_core)]
         cpu_cntl: CPU_CTRL<'static>,
@@ -36,9 +35,8 @@ mod tests {
     #[allow(unused)] // compile test
     fn baremetal_preempt_can_be_initialized_with_any_timer(
         timer: esp_hal::timer::AnyTimer<'static>,
-        int: FROM_CPU_INTR0<'static>,
     ) {
-        esp_rtos::start(timer, int);
+        esp_rtos::start(timer);
     }
 
     #[init]
@@ -49,11 +47,9 @@ mod tests {
         let p = esp_hal::init(config);
 
         let timg0 = TimerGroup::new(p.TIMG0);
-        esp_rtos::start(timg0.timer0, p.FROM_CPU_INTR0);
+        esp_rtos::start(timg0.timer0);
 
         Context {
-            #[cfg(multi_core)]
-            sw_int1: p.FROM_CPU_INTR1,
             sw_int2: p.FROM_CPU_INTR2,
             #[cfg(multi_core)]
             cpu_cntl: p.CPU_CTRL,
@@ -66,9 +62,9 @@ mod tests {
     #[should_panic]
     fn panics_in_interrupt_context() {
         #[embassy_executor::task]
-        async fn try_init(timer: TIMG0<'static>, sw_int0: FROM_CPU_INTR0<'static>) {
+        async fn try_init(timer: TIMG0<'static>) {
             let timg0 = TimerGroup::new(timer);
-            esp_rtos::start(timg0.timer0, sw_int0);
+            esp_rtos::start(timg0.timer0);
         }
 
         crate::init_heap();
@@ -76,13 +72,13 @@ mod tests {
         let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
         let p = esp_hal::init(config);
 
-        static EXECUTOR_CORE_0: StaticCell<InterruptExecutor<1>> = StaticCell::new();
-        let executor_core0 = InterruptExecutor::new(p.FROM_CPU_INTR1);
+        static EXECUTOR_CORE_0: StaticCell<InterruptExecutor<2>> = StaticCell::new();
+        let executor_core0 = InterruptExecutor::new(p.FROM_CPU_INTR2);
         let executor_core0 = EXECUTOR_CORE_0.init(executor_core0);
 
         let spawner = executor_core0.start(Priority::Priority1);
 
-        spawner.spawn(try_init(p.TIMG0, p.FROM_CPU_INTR0).unwrap());
+        spawner.spawn(try_init(p.TIMG0).unwrap());
     }
 
     #[test]
@@ -92,6 +88,110 @@ mod tests {
         CurrentThreadHandle::get().delay(Duration::from_millis(10));
 
         hil_test::assert!(now.elapsed() >= Duration::from_millis(10));
+    }
+
+    #[test]
+    fn thread_runs_a_function_and_returns_its_value() {
+        fn worker() -> u32 {
+            42
+        }
+
+        let handle = ThreadSpawner::new(4096).with_name("worker").spawn(worker);
+
+        hil_test::assert_eq!(handle.name(), Some("worker"));
+
+        let (value, _spawner) = handle.join();
+        hil_test::assert_eq!(value, 42);
+    }
+
+    #[test]
+    fn thread_returns_a_value_that_is_not_copy() {
+        let captured = Box::new(3_u32);
+
+        let handle = ThreadSpawner::new(4096).spawn(move || {
+            let mut items = alloc::vec::Vec::new();
+            items.push(*captured);
+            items.push(*captured);
+            items
+        });
+
+        let (value, _spawner) = handle.join();
+        hil_test::assert_eq!(value.len(), 2);
+        hil_test::assert_eq!(value[0], 3);
+        hil_test::assert_eq!(value[1], 3);
+    }
+
+    #[test]
+    fn a_static_stack_can_be_reused_after_a_join() {
+        static STACK: ConstStaticCell<ThreadStack<4096>> = ConstStaticCell::new(ThreadStack::new());
+
+        let spawner = ThreadSpawner::from_static(STACK.take()).with_priority(2);
+
+        let (first, spawner) = spawner.spawn(|| 1_u32).join();
+        let (second, _spawner) = spawner.spawn(|| 2_u32).join();
+
+        hil_test::assert_eq!(first, 1);
+        hil_test::assert_eq!(second, 2);
+    }
+
+    #[test]
+    fn a_detached_thread_keeps_running() {
+        static FINISHED: AtomicBool = AtomicBool::new(false);
+
+        ThreadSpawner::new(4096)
+            .spawn(|| {
+                CurrentThreadHandle::get().delay(Duration::from_millis(10));
+                FINISHED.store(true, Ordering::SeqCst);
+            })
+            .detach();
+
+        while !FINISHED.load(Ordering::SeqCst) {
+            CurrentThreadHandle::get().delay(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn a_detached_thread_drops_its_return_value() {
+        static DROPPED: AtomicBool = AtomicBool::new(false);
+
+        struct Observed;
+        impl Drop for Observed {
+            fn drop(&mut self) {
+                DROPPED.store(true, Ordering::SeqCst);
+            }
+        }
+
+        ThreadSpawner::new(4096).spawn(|| Observed).detach();
+
+        while !DROPPED.load(Ordering::SeqCst) {
+            CurrentThreadHandle::get().delay(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    #[cfg(multi_core)]
+    fn a_thread_can_be_pinned_to_the_second_core(ctx: Context) {
+        esp_rtos::start_second_core(
+            unsafe { ctx.cpu_cntl.clone_unchecked() },
+            #[allow(static_mut_refs)]
+            unsafe {
+                &mut crate::APP_CORE_STACK
+            },
+            || {},
+        );
+
+        let (cpu, _spawner) = ThreadSpawner::new(4096)
+            .with_pinned_to(Cpu::AppCpu)
+            .with_priority(2)
+            .spawn(Cpu::current)
+            .join();
+
+        hil_test::assert!(cpu == Cpu::AppCpu);
+
+        unsafe {
+            // Park the second core, we don't need it anymore
+            esp_hal::system::CpuControl::new(ctx.cpu_cntl).park_core(Cpu::AppCpu);
+        }
     }
 
     #[test]
@@ -461,7 +561,6 @@ mod tests {
 
         esp_rtos::start_second_core(
             unsafe { ctx.cpu_cntl.clone_unchecked() },
-            ctx.sw_int1,
             #[allow(static_mut_refs)]
             unsafe {
                 &mut crate::APP_CORE_STACK
@@ -537,7 +636,6 @@ mod tests {
 
         esp_rtos::start_second_core(
             unsafe { ctx.cpu_cntl.clone_unchecked() },
-            ctx.sw_int1,
             #[allow(static_mut_refs)]
             unsafe {
                 &mut crate::APP_CORE_STACK
@@ -588,6 +686,112 @@ mod tests {
         }
     }
 
+    /// State that the victim and the waker of `woken_task_runs_on_one_core` share.
+    #[cfg(multi_core)]
+    struct WakeTest {
+        victim: SemaphoreHandle,
+        waker: SemaphoreHandle,
+        victim_blocks_on_core_0: AtomicBool,
+        victim_running: AtomicBool,
+        rounds: AtomicUsize,
+    }
+
+    /// Wakes the waker, then blocks. `context` points to a `WakeTest`.
+    #[cfg(multi_core)]
+    extern "C" fn wake_test_victim(context: *mut c_void) {
+        let test = unsafe { &*(context as *const WakeTest) };
+        loop {
+            test.waker.give();
+            test.victim_blocks_on_core_0
+                .store(Cpu::current() == Cpu::ProCpu, Ordering::Relaxed);
+            test.victim.take(None);
+
+            hil_test::assert!(
+                !test.victim_running.swap(true, Ordering::Relaxed),
+                "Two cores run the same task"
+            );
+            // Must be longer than the busy interrupt, so that two copies of the task overlap here.
+            let start = Instant::now();
+            while start.elapsed() < Duration::from_micros(200) {}
+            test.victim_running.store(false, Ordering::Relaxed);
+
+            test.rounds.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Delays core 0 while the victim blocks, wakes the victim, then blocks.
+    ///
+    /// `context` points to a `WakeTest`.
+    #[cfg(multi_core)]
+    extern "C" fn wake_test_waker(context: *mut c_void) {
+        let test = unsafe { &*(context as *const WakeTest) };
+        loop {
+            test.waker.take(None);
+
+            let start = Instant::now();
+            while !test.victim_blocks_on_core_0.swap(false, Ordering::Relaxed)
+                && start.elapsed() < Duration::from_millis(10)
+            {}
+            SoftwareInterrupt::<'static, 2>::new(unsafe { FROM_CPU_INTR2::steal() }).raise();
+            test.victim.give();
+        }
+    }
+
+    #[test]
+    #[timeout(10)]
+    #[cfg(multi_core)]
+    fn woken_task_runs_on_one_core(ctx: Context) {
+        // The victim blocks on core 0. The waker on core 1 delays the switch on core 0.
+        // The waker then wakes the victim and blocks.
+        // Core 1 selects a task while core 0 still runs the victim.
+        #[esp_hal::handler(priority = Priority::Priority3)]
+        fn keep_core_busy() {
+            SoftwareInterrupt::<'static, 2>::new(unsafe { FROM_CPU_INTR2::steal() }).reset();
+            let start = Instant::now();
+            while start.elapsed() < Duration::from_micros(100) {}
+        }
+
+        esp_rtos::start_second_core(
+            unsafe { ctx.cpu_cntl.clone_unchecked() },
+            #[allow(static_mut_refs)]
+            unsafe {
+                &mut crate::APP_CORE_STACK
+            },
+            || {},
+        );
+
+        // The main task must preempt the victim to check the result.
+        CurrentThreadHandle::get().set_priority(5);
+
+        let mut sw_int2 = SoftwareInterrupt::new(ctx.sw_int2);
+        sw_int2.set_interrupt_handler(keep_core_busy);
+
+        let test: &'static WakeTest = Box::leak(Box::new(WakeTest {
+            victim: SemaphoreHandle::new(SemaphoreKind::Counting { initial: 0, max: 1 }),
+            waker: SemaphoreHandle::new(SemaphoreKind::Counting { initial: 0, max: 1 }),
+            victim_blocks_on_core_0: AtomicBool::new(false),
+            victim_running: AtomicBool::new(false),
+            rounds: AtomicUsize::new(0),
+        }));
+        let context = (test as *const WakeTest).cast::<c_void>().cast_mut();
+        unsafe {
+            preempt::task_create("waker", wake_test_waker, context, 2, Some(1), 4096);
+            preempt::task_create("victim", wake_test_victim, context, 1, None, 4096);
+        }
+
+        CurrentThreadHandle::get().delay(Duration::from_secs(3));
+
+        hil_test::assert!(
+            test.rounds.load(Ordering::Relaxed) > 0,
+            "The victim never woke up"
+        );
+
+        unsafe {
+            // Park the second core, we don't need it anymore
+            esp_hal::system::CpuControl::new(ctx.cpu_cntl).park_core(Cpu::AppCpu);
+        }
+    }
+
     #[test]
     #[cfg(multi_core)]
     async fn embassy_cross_core(ctx: Context) {
@@ -603,7 +807,6 @@ mod tests {
 
         esp_rtos::start_second_core(
             unsafe { ctx.cpu_cntl.clone_unchecked() },
-            ctx.sw_int1,
             #[allow(static_mut_refs)]
             unsafe {
                 &mut crate::APP_CORE_STACK
@@ -651,7 +854,6 @@ mod tests {
 
         esp_rtos::start_second_core(
             unsafe { ctx.cpu_cntl.clone_unchecked() },
-            ctx.sw_int1,
             #[allow(static_mut_refs)]
             unsafe {
                 &mut crate::APP_CORE_STACK
@@ -698,7 +900,7 @@ mod tests {
 
         static SIGNAL: Signal<RawMutex, ()> = Signal::new();
 
-        let _gaurd = esp_hal::system::CpuControl::new(ctx.cpu_cntl)
+        let _guard = esp_hal::system::CpuControl::new(ctx.cpu_cntl)
             .start_app_core(
                 #[allow(static_mut_refs)]
                 unsafe {
@@ -878,7 +1080,7 @@ mod second_core_only {
 
     use esp_hal::{
         clock::CpuClock,
-        peripherals::{CPU_CTRL, FROM_CPU_INTR1},
+        peripherals::CPU_CTRL,
         system::Cpu,
         time::Duration,
         timer::timg::{Timer, TimerGroup},
@@ -889,7 +1091,6 @@ mod second_core_only {
 
     struct Context {
         cpu_control: CPU_CTRL<'static>,
-        sw_int1: FROM_CPU_INTR1<'static>,
         timer: Timer<'static>,
     }
 
@@ -904,7 +1105,6 @@ mod second_core_only {
 
         Context {
             cpu_control: p.CPU_CTRL,
-            sw_int1: p.FROM_CPU_INTR1,
             timer: timg0.timer0,
         }
     }
@@ -912,7 +1112,6 @@ mod second_core_only {
     fn start_on_second_core(ctx: Context, func: impl FnOnce() + Send + 'static) {
         esp_rtos::start_on_second_core_only(
             ctx.cpu_control,
-            ctx.sw_int1,
             ctx.timer,
             #[allow(static_mut_refs)]
             unsafe {

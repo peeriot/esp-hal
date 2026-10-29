@@ -1,16 +1,22 @@
 #![cfg_attr(docsrs, procmacros::doc_replace)]
 //! # Software Interrupts
 //!
-//! The [`SoftwareInterrupt`] struct allows raising or resetting software
-//! interrupts using the [`raise()`][SoftwareInterrupt::raise] and
-//! [`reset()`][SoftwareInterrupt::reset] methods.
-//!
+//! [`SoftwareInterrupt`] raises or resets software interrupts with
+//! [`raise()`][SoftwareInterrupt::raise] and [`reset()`][SoftwareInterrupt::reset].
+#![cfg_attr(
+    all(feature = "rt", multi_core),
+    doc = "The HAL reserves `FROM_CPU_INTR0` and `FROM_CPU_INTR1` for inter-processor call (IPC)."
+)]
+#![cfg_attr(
+    all(feature = "rt", single_core, context_switch_source = "from_cpu"),
+    doc = "The HAL reserves `FROM_CPU_INTR0` to switch tasks."
+)]
 //! ## Examples
 //!
 //! ```rust, no_run
 //! # {before_snippet}
 //! // Take the interrupt you want to use.
-//! let mut int0 = SoftwareInterrupt::new(peripherals.FROM_CPU_INTR0);
+//! let mut int0 = SoftwareInterrupt::new(peripherals.FROM_CPU_INTR2);
 //!
 //! // Set up the interrupt handler. Do this in a critical section so the global
 //! // contains the interrupt object before the interrupt is triggered.
@@ -26,7 +32,7 @@
 //! // ... somewhere outside of your main function
 //!
 //! // Define a shared handle to the software interrupt.
-//! static SWINT0: Mutex<RefCell<Option<SoftwareInterrupt<0>>>> = Mutex::new(RefCell::new(None));
+//! static SWINT0: Mutex<RefCell<Option<SoftwareInterrupt<2>>>> = Mutex::new(RefCell::new(None));
 //!
 //! #[esp_hal::handler]
 //! fn swint0_handler() {
@@ -57,7 +63,7 @@ pub struct SoftwareInterrupt<'d, const NUM: u8> {
 }
 
 impl<'d, const NUM: u8> SoftwareInterrupt<'d, NUM> {
-    /// Create a software interrupt driver.
+    /// Creates a new software interrupt driver.
     #[inline]
     pub const fn new(instance: impl Instance<NUM> + 'd) -> Self {
         core::mem::forget(instance); // needed to make `new` const
@@ -66,7 +72,7 @@ impl<'d, const NUM: u8> SoftwareInterrupt<'d, NUM> {
         }
     }
 
-    /// Sets the interrupt handler for this software-interrupt
+    /// Sets the interrupt handler for this software-interrupt.
     #[instability::unstable]
     pub fn set_interrupt_handler(&mut self, handler: InterruptHandler) {
         let interrupt;
@@ -86,7 +92,7 @@ impl<'d, const NUM: u8> SoftwareInterrupt<'d, NUM> {
         interrupt::bind_handler(interrupt, handler);
     }
 
-    /// Trigger this software-interrupt
+    /// Triggers this software-interrupt.
     #[crate::ram]
     pub fn raise(&self) {
         let regs = cfg_select! {
@@ -125,7 +131,7 @@ impl<'d, const NUM: u8> SoftwareInterrupt<'d, NUM> {
         crate::interrupt::InterruptStatus::is_pending(interrupt)
     }
 
-    /// Resets this software-interrupt
+    /// Resets this software-interrupt.
     pub fn reset(&self) {
         cfg_select! {
             soc_has_intpri => {

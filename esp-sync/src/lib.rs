@@ -1,4 +1,4 @@
-//! Syncronization primitives for ESP32 devices
+//! Synchronization primitives for ESP32 devices
 //!
 //! ## Feature Flags
 #![doc = document_features::document_features!(feature_label = r#"<span class="stab portability"><code>{feature}</code></span>"#)]
@@ -116,17 +116,17 @@ mod single_core {
 mod multi_core {
     use core::sync::atomic::{AtomicUsize, Ordering};
 
-    // Safety: Ensure that when adding new chips `raw_core` doesn't return this
-    // value.
-    const UNUSED_THREAD_ID_VALUE: usize = 0x100;
+    // Zero, so that a static mutex is placed in `.bss`.
+    const UNUSED_THREAD_ID_VALUE: usize = 0;
 
     #[inline]
     fn thread_id() -> usize {
         // This method must never return UNUSED_THREAD_ID_VALUE
         cfg_select! {
-            all(multi_core, riscv) => riscv::register::mhartid::read(),
-            all(multi_core, xtensa) => (xtensa_lx::get_processor_id() & 0x2000) as usize,
-            _ => 0,
+            // `mhartid` is 0 on the first core.
+            all(multi_core, riscv) => riscv::register::mhartid::read() + 1,
+            // `PRID` is 0xCDCD on the PRO CPU and 0xABAB on the APP CPU.
+            all(multi_core, xtensa) => xtensa_lx::get_processor_id() as usize,
         }
     }
 
@@ -288,7 +288,7 @@ impl<L: RawLock> GenericRawMutex<L> {
 #[cfg_attr(
     multi_core,
     doc = r#"It needs a bit of memory, but it does not take a global critical
-    section, making it preferrable for use in multi-core systems."#
+    section, making it preferable for use in multi-core systems."#
 )]
 pub struct RawMutex {
     inner: GenericRawMutex<SingleCoreInterruptLock>,

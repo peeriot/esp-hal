@@ -57,7 +57,7 @@ async fn main(_spawner: Spawner) {
     let p = esp_hal::init(config);
 
     let timg0 = TimerGroup::new(p.TIMG0);
-    esp_rtos::start(timg0.timer0, p.FROM_CPU_INTR0);
+    esp_rtos::start(timg0.timer0);
 
     let connector = BleConnector::new(p.BT, Default::default()).unwrap();
     let controller: ExternalController<_, 1> = ExternalController::new(connector);
@@ -71,7 +71,7 @@ where
 {
     let address = Address::random(PERIPHERAL_ADDRESS);
 
-    let mut resources: HostResources<_, DefaultPacketPool, 1, 2> = HostResources::new();
+    let mut resources: HostResources<DefaultPacketPool, 1, 2> = HostResources::new();
     let stack = trouble_host::new(controller, &mut resources)
         .set_random_address(address)
         .build();

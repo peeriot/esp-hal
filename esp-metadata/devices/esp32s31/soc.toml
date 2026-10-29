@@ -18,6 +18,9 @@ support_note = "In early stages of development."
 page_size = 0x10000
 entry_num = 1024
 
+[device.flash]
+support_status = "partial"
+
 [device.rom]
 has_crc_le  = true
 has_crc_be  = true
@@ -27,17 +30,19 @@ has_md5_bsd = true
 multi_core_enabled = true
 cpu_has_branch_predictor = true
 cpu_has_csr_pc = false
+cpu_has_zcmp_workaround = true
 cpu_csr_prv_mode = 0x810
 cpu_mcause_mask = 0x3f
+cpu_pmp_granularity = 128
 
 has_swd_watchdog = true
 
-# SRAM_START = 0x2F000000, SRAM_SEG_END = 0x2F07AFC0 (from esp-idf ld.hp_mem_defs)
-# dram2_uninit: SRAM_SEG_END..SOC_ROM_STACK_START (PRO CPU stack, reclaimable)
+# SOC_DRAM_LOW = 0x2F000000, SOC_DRAM_HIGH = 0x2F080000 (from soc.h)
 # SOC_ROM_STACK_START = 0x2F07CFB0 (from soc.h)
 memory_map = { ranges = [
-    { name = "dram", start = 0x2F00_0000, end = 0x2F07_AFC0 },
-    { name = "dram2_uninit", start = 0x2F07_AFC0, end = 0x2F07_CFB0 },
+    { name = "dram", start = 0x2F00_0000, end = 0x2F08_0000 },
+    # start address from the 2nd stage bootloader's linker script: https://github.com/espressif/esp-idf/blob/383dda6c182/components/bootloader/subproject/main/ld/esp32s31/bootloader.memory.ld.in#L52
+    { name = "dram2_uninit", start = 0x2F06_CFB0, end = 0x2F07_CFB0 },
     { name = "irom", start = 0x4000_0000, end = 0x5000_0000 },
     { name = "drom", start = 0x4000_0000, end = 0x5000_0000 },
 ] }
@@ -48,8 +53,13 @@ peripherals = [
     { name = "ASSIST_DEBUG" },
     { name = "CACHE" },
     { name = "CLIC" },
+    { name = "CLINT" },
+    { name = "CLINT_OTHER_CORE" },
     { name = "CNNT_SYS", hidden = true },
     { name = "CNNT_IO_MUX", hidden = true },
+    { name = "ETH", virtual = true, interrupts = { peri = "SBD" } },
+    { name = "EMAC_DMA", pac = "GMAC_DMA", hidden = true },
+    { name = "EMAC_MAC", pac = "GMAC", hidden = true },
     { name = "ECC" },
     { name = "EFUSE", hidden = true },
     { name = "GPIO" },
@@ -61,9 +71,13 @@ peripherals = [
     { name = "HP_SYS_CLKRST" },
     { name = "I2C0", interrupts = { peri = "I2C0" }, clock_group = "I2C", stable = true },
     { name = "I2C1", interrupts = { peri = "I2C1" }, clock_group = "I2C", stable = true },
+    { name = "I2S0", interrupts = { peri = "I2S0" }, clock_group = "I2S" },
+    { name = "I2S1", interrupts = { peri = "I2S1" }, clock_group = "I2S" },
+    { name = "IEEE802154", interrupts = { mac = "MODEM_ZB_MAC" } },
     { name = "INTERRUPT_CORE0" },
     { name = "INTERRUPT_CORE1" },
     { name = "IO_MUX" },
+    { name = "LCD_CAM", interrupts = { peri = "LCD_CAM" }, clock_group = "LCD_CAM" },
     { name = "IOMUX_MSPI_PIN", hidden = true },
     { name = "LP_AON_CLK_RST", pac = "LP_AON_CLKRST" },
     { name = "LP_APM" },
@@ -78,10 +92,12 @@ peripherals = [
     { name = "MODEM_LPCON" },
     { name = "MODEM_SYSCON" },
     { name = "PAU" },
+    { name = "PCNT",  interrupts = { peri = "PCNT0" } },
+    { name = "PCNT1", interrupts = { peri = "PCNT1" } },
     { name = "PMU" },
     { name = "RTC_TIMER", pac = "LP_TIMER" },
     { name = "RNG", pac = "TRNG" },
-    { name = "RMT", virtual = true, interrupts = { peri = "RMT" }, clock_group = "RMT" }, # PAC field names differ from ESP32-S3; overlay_rmt maps them.
+    { name = "RMT", interrupts = { peri = "RMT" }, clock_group = "RMT" },
     { name = "RSA", interrupts = { peri = "RSA" } },
     { name = "SPI0" },
     { name = "SPI1" },
@@ -108,10 +124,13 @@ peripherals = [
 
     { name = "ADC1", virtual = true },
     { name = "ADC2", virtual = true },
+    { name = "BT", virtual = true, interrupts = { mac = "MODEM_BT_MAC", bb = "MODEM_BT_BB", lp_timer = "MODEM_LP_TIMER" } },
     { name = "FLASH", virtual = true },
     { name = "PSRAM", virtual = true, clock_group = "PSRAM" },
     { name = "GPIO_DEDICATED", virtual = true },
+    { name = "WIFI", virtual = true, interrupts = { bb = "MODEM_WIFI_BB", mac = "MODEM_WIFI_MAC", pwr = "MODEM_WIFI_PWR" }, stable = true },
     { name = "CPU_CTRL", virtual = true },
+    { name = "IPC", virtual = true },
     { name = "FROM_CPU_INTR0", virtual = true },
     { name = "FROM_CPU_INTR1", virtual = true },
     { name = "FROM_CPU_INTR2", virtual = true },
@@ -127,12 +146,15 @@ support_status = "partial"
 status_registers = 6
 software_interrupt_count = 4
 controller = { Riscv = { flavour = "clic", interrupts = 48, priority_levels = 8 } }
+context_switch_source = "ipc"
 
 [device.timergroup]
 support_status = "partial"
 instances = [{ name = "timg0" }, { name = "timg1" }]
+timg_has_timer1 = true
 timg_has_divcnt_rst = true
 rc_fast_calibration = { divider = 50, min_rev = 0 }
+wdt_has_conf_update = true
 
 [device.gpio]
 support_status = "supported"
@@ -153,8 +175,8 @@ support_status = "supported"
 instances = [
     { name = "uart0", sys_instance = "Uart0", tx = "U0TXD", rx = "U0RXD", cts = "U0CTS", rts = "U0RTS" },
     { name = "uart1", sys_instance = "Uart1", tx = "U1TXD", rx = "U1RXD", cts = "U1CTS", rts = "U1RTS" },
-    { name = "uart2", sys_instance = "Uart2", tx = "U2TXD", rx = "U2RXD", cts = "U2CTS", rts = "U2RTS" },
-    { name = "uart3", sys_instance = "Uart3", tx = "U3TXD", rx = "U3RXD", cts = "U3CTS", rts = "U3RTS" },
+    { name = "uart2", sys_instance = "Uart2", tx = "U2TXD", rx = "U2RXD", cts = "U2CTS", rts = "U2RTS", wakeup_source = false },
+    { name = "uart3", sys_instance = "Uart3", tx = "U3TXD", rx = "U3RXD", cts = "U3CTS", rts = "U3RTS", wakeup_source = false },
 ]
 ram_size = 128
 version = 2
@@ -198,12 +220,12 @@ has_region_monitor = true
 
 [device.rng]
 support_status = { status = "partial", issue = 5977 }
-trng_supported = false  # TODO
+trng_supported = true
 apb_cycle_wait_num = 16 # TODO
 is_lp_sys = false
 
 [device.sleep]
-support_status = "not_supported"
+support_status = "partial"
 light_sleep = true
 deep_sleep = true
 ext1_version = 3
@@ -220,6 +242,11 @@ wakeup_sources = {
     WifiBeacon = 23,
     Bt = 25,
 }
+
+[device.sleep.retention]
+cpu_retention = "software"
+cpu_retention_frame = "s31"
+supports_top_power_down = true
 
 [device.usb_otg_hs]
 fifo_depth_words = 896
@@ -279,9 +306,11 @@ engines = [
         name = "AHB_GDMA",
         max_priority = 15,
         burst_sizes = [0, 4, 16, 32, 64],
-        drivers = ["uhci"],
+        drivers = ["uhci", "i2s"],
         peripheral_instances = [
             { name = "UHCI0", dma_id = 0 },
+            { name = "I2S0", dma_id = 1 },
+            { name = "I2S1", dma_id = 5 },
         ],
         channels = [
             { name = "DMA_CH0", mem2mem = true, mem2mem_id = 9, interrupt_in = "AHB_PDMA_IN_CH0", interrupt_out = "AHB_PDMA_OUT_CH0" },
@@ -295,9 +324,9 @@ engines = [
         name = "AXI_GDMA",
         max_priority = 15,
         burst_sizes = [8, 16, 32, 64, 128],
-        drivers = ["spi_master", "spi_slave", "aes"],
+        drivers = ["spi_master", "spi_slave", "aes", "lcd_cam"],
         peripheral_instances = [
-            # LCD_CAM
+            { name = "LCD_CAM", dma_id = 0 },
             { name = "SPI2", dma_id = 1 },
             { name = "SPI3", dma_id = 2 },
             # PARL_IO
@@ -313,7 +342,7 @@ engines = [
 ]
 
 [device.ecc]
-support_status = { status = "partial", issue = 5972 }
+support_status = "partial"
 working_modes = [
     { id = 0, mode = "affine_point_multiplication" },
     { id = 2, mode = "affine_point_verification" },
@@ -328,10 +357,10 @@ working_modes = [
     { id = 11, mode = "modular_division" }
 ]
 curves = [
-    { id = 0, curve = 192 },
-    { id = 1, curve = 256 },
-    { id = 2, curve = 384 },
-    # TODO: SM2 = 3
+    { id = 0, curve = "p192" },
+    { id = 1, curve = "p256" },
+    { id = 2, curve = "p384" },
+    { id = 3, curve = "sm2" },
 ]
 separate_jacobian_point_memory = true
 has_memory_clock_gate = true
@@ -364,7 +393,7 @@ algo = {
     sha512_224 = 5,
     sha512_256 = 6,
     sha512_t = 7,
-    # TODO: sm3 = 14
+    sm3 = 14,
 }
 
 [device.hmac]
@@ -384,33 +413,95 @@ instances = [
 [device.usb_serial_jtag]
 support_status = "partial"
 
+[device.camera]
+support_status = "partial"
+
 # Peripherals the chip has, that no driver reaches yet.
 [device.avc]
 support_status = "not_supported"
 [device.bit_scrambler]
 support_status = "not_supported"
-[device.camera]
-support_status = "not_supported"
 [device.dac]
 support_status = "not_supported"
 [device.ethernet]
-support_status = "not_supported"
+support_status = "partial"
+mii_via_gpio_matrix = true
+dma_burst_len = 16
+has_rgmii = true
+rx_checksum_offload = true
+tx_checksum_offload = false # TX FIFO is too small for store-and-forward insertion
 [device.etm]
 support_status = "not_supported"
 [device.i2c_slave]
 support_status = "not_supported"
 [device.i2s]
-support_status = "not_supported"
+support_status = "partial"
+version = 3
+clock_configured_by_hp_sys_clkrst = true
+mclk_divider_bit_width = 8
+max_ws_width = 512
+supports_pdm_rx_hp_filter = true
+instances = [
+    {
+        name = "i2s0",
+        sys_instance = "I2s0",
+        mclk = "I2S0_MCLK",
+        bclk = "I2S0O_BCK",
+        ws = "I2S0O_WS",
+        bclk_rx = "I2S0I_BCK",
+        ws_rx = "I2S0I_WS",
+        dout = ["I2S0O_SD", "I2S0O_SD1"],
+        din = ["I2S0I_SD", "I2S0I_SD1", "I2S0I_SD2", "I2S0I_SD3"],
+        pdm_tx = true,
+        pdm_rx = true,
+        pcm2pdm = true,
+        pdm2pcm = true,
+    },
+    {
+        name = "i2s1",
+        sys_instance = "I2s1",
+        mclk = "I2S1_MCLK",
+        bclk = "I2S1O_BCK",
+        ws = "I2S1O_WS",
+        bclk_rx = "I2S1I_BCK",
+        ws_rx = "I2S1I_WS",
+        dout = ["I2S1O_SD"],
+        din = ["I2S1I_SD"],
+        pdm_tx = true,
+        pdm_rx = true,
+    },
+]
 [device.ieee802154]
-support_status = "not_supported"
 [device.key_manager]
 support_status = "not_supported"
 [device.mcpwm]
 support_status = "not_supported"
 [device.pcnt]
-support_status = "not_supported"
+instances = {
+    PCNT = {
+        sys_instance = "Pcnt",
+        interrupt = "PCNT0",
+        units = [
+            { sig_ch0 = "PCNT0_SIG_CH0", sig_ch1 = "PCNT0_SIG_CH1", ctrl_ch0 = "PCNT0_CTRL_CH0", ctrl_ch1 = "PCNT0_CTRL_CH1" },
+            { sig_ch0 = "PCNT1_SIG_CH0", sig_ch1 = "PCNT1_SIG_CH1", ctrl_ch0 = "PCNT1_CTRL_CH0", ctrl_ch1 = "PCNT1_CTRL_CH1" },
+            { sig_ch0 = "PCNT2_SIG_CH0", sig_ch1 = "PCNT2_SIG_CH1", ctrl_ch0 = "PCNT2_CTRL_CH0", ctrl_ch1 = "PCNT2_CTRL_CH1" },
+            { sig_ch0 = "PCNT3_SIG_CH0", sig_ch1 = "PCNT3_SIG_CH1", ctrl_ch0 = "PCNT3_CTRL_CH0", ctrl_ch1 = "PCNT3_CTRL_CH1" },
+        ],
+    },
+    PCNT1 = {
+        sys_instance = "Pcnt1",
+        interrupt = "PCNT1",
+        units = [
+            { sig_ch0 = "PCNT1_U0_SIG_CH0", sig_ch1 = "PCNT1_U0_SIG_CH1", ctrl_ch0 = "PCNT1_U0_CTRL_CH0", ctrl_ch1 = "PCNT1_U0_CTRL_CH1" },
+            { sig_ch0 = "PCNT1_U1_SIG_CH0", sig_ch1 = "PCNT1_U1_SIG_CH1", ctrl_ch0 = "PCNT1_U1_CTRL_CH0", ctrl_ch1 = "PCNT1_U1_CTRL_CH1" },
+            { sig_ch0 = "PCNT1_U2_SIG_CH0", sig_ch1 = "PCNT1_U2_SIG_CH1", ctrl_ch0 = "PCNT1_U2_CTRL_CH0", ctrl_ch1 = "PCNT1_U2_CTRL_CH1" },
+            { sig_ch0 = "PCNT1_U3_SIG_CH0", sig_ch1 = "PCNT1_U3_SIG_CH1", ctrl_ch0 = "PCNT1_U3_CTRL_CH0", ctrl_ch1 = "PCNT1_U3_CTRL_CH1" },
+        ],
+    },
+}
 [device.rgb_display]
-support_status = "not_supported"
+support_status = "partial"
+output_lines = 24
 
 [device.sdm]
 support_status = "partial"
@@ -443,7 +534,9 @@ has_rx_demodulation = true
 
 [device.parl_io]
 support_status = "not_supported"
-version = 1 # FIXME placeholder
+version = 2
+max_data_width = 16
+has_tx_cs = true
 
 [device.sdmmc]
 support_status = "partial"
@@ -473,16 +566,21 @@ slot_config = [
 
 ## Radio
 [device.wifi]
-support_status = "not_supported"
-mac_version = 1 # FIXME: placeholder
-csi_supported = true # FIXME: placeholder
+support_status = "partial"
+mac_version = 3
+has_wifi6 = true
+csi_supported = true
+has_nan = true
+has_ftm = true
 
 [device.bt]
-support_status = "not_supported"
-controller = "npl" # FIXME: placeholder
+support_status = "partial"
+# IDF `porting_btdm` (nested config + `esp_*` VHCI), not the ESP32/C3/S3 OSI table
+controller = "btdm2"
 
 [device.phy]
-support_status = "not_supported"
+support_status = "partial"
+combo_module = false
 
 [device.ledc]
 support_status = "not_supported"
@@ -494,6 +592,7 @@ support_status = "not_supported"
 ram_size = 20 # FIXME: placeholder
 
 [device.psram]
+support_status = "partial"
 extmem_origin = 0x5000_0000
 octal_spi = true
 

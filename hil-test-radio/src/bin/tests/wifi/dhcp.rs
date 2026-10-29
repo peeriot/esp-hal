@@ -1,5 +1,6 @@
 #[embedded_test::tests(default_timeout = 45, executor = esp_rtos::embassy::Executor::new())]
 mod tests {
+    use embassy_futures::select::{Either, select};
     use embassy_net::{
         Runner,
         StackResources,
@@ -132,7 +133,7 @@ mod tests {
         let spawner = unsafe { embassy_executor::Spawner::for_current_executor().await };
 
         let timg0 = TimerGroup::new(p.TIMG0);
-        esp_rtos::start(timg0.timer0, p.FROM_CPU_INTR0);
+        esp_rtos::start(timg0.timer0);
 
         let wifi_interface = Interface::station();
         let controller = esp_radio::wifi::WifiController::new(
@@ -145,9 +146,32 @@ mod tests {
     }
 
     #[test]
+    async fn unchanged_access_point_config_keeps_the_station(p: Peripherals) {
+        let timg0 = TimerGroup::new(p.TIMG0);
+        esp_rtos::start(timg0.timer0);
+
+        let mut controller = esp_radio::wifi::WifiController::new(
+            p.WIFI,
+            ControllerConfig::default().with_initial_config(station_config()),
+        )
+        .unwrap();
+
+        connect_with_retry(&mut controller).await;
+
+        // The support firmware applies its unchanged configuration again 1 s after a station
+        // connects.
+        let disconnect = controller.wait_for_disconnect_async();
+        let result = select(disconnect, Timer::after(Duration::from_secs(5))).await;
+        assert!(
+            matches!(result, Either::Second(())),
+            "The station was disconnected"
+        );
+    }
+
+    #[test]
     async fn wifi_drop(p: Peripherals) {
         let timg0 = TimerGroup::new(p.TIMG0);
-        esp_rtos::start(timg0.timer0, p.FROM_CPU_INTR0);
+        esp_rtos::start(timg0.timer0);
 
         let spawner = unsafe { embassy_executor::Spawner::for_current_executor().await };
         let mut wifi = p.WIFI;

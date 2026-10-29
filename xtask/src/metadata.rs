@@ -18,7 +18,7 @@ use anyhow::{Context, Result, bail};
 use strum::IntoEnumIterator;
 
 /// Cache layout this devtool understands. Must match `esp-metadata`.
-const CACHE_VERSION: u32 = 1;
+const CACHE_VERSION: u32 = 2;
 
 /// Supported devices.
 #[derive(
@@ -44,24 +44,36 @@ pub enum Chip {
     /// ESP32
     Esp32,
     /// ESP32-C2, ESP8684
+    #[value(alias = "c2")]
     Esp32c2,
     /// ESP32-C3, ESP8685
+    #[value(alias = "c3")]
     Esp32c3,
     /// ESP32-C5
+    #[value(alias = "c5")]
     Esp32c5,
     /// ESP32-C6
+    #[value(alias = "c6")]
     Esp32c6,
     /// ESP32-C61
+    #[value(alias = "c61")]
     Esp32c61,
     /// ESP32-H2
+    #[value(alias = "h2")]
     Esp32h2,
+    /// ESP32-H4
+    Esp32h4,
     /// ESP32-P4 (chip revision v3.x / eco5 only)
+    #[value(alias = "p4")]
     Esp32p4,
     /// ESP32-S2
+    #[value(alias = "s2")]
     Esp32s2,
     /// ESP32-S3
+    #[value(alias = "s3")]
     Esp32s3,
     /// ESP32-S31
+    #[value(alias = "s31")]
     Esp32s31,
 }
 
@@ -104,6 +116,11 @@ impl Chip {
     }
 }
 
+/// Pre-rendered HTML peripheral support matrix for the `esp-hal` documentation index.
+pub fn peripheral_support_html() -> &'static str {
+    &cache().peripheral_support_html
+}
+
 /// The configuration symbols of a single device.
 #[derive(Debug, Default, Clone)]
 pub struct Config {
@@ -143,6 +160,7 @@ struct Cache {
     hash: String,
     symbols: Vec<String>,
     kv_symbols: Vec<String>,
+    peripheral_support_html: String,
     chips: BTreeMap<String, ChipCache>,
 }
 

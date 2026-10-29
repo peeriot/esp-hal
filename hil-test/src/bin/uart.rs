@@ -29,11 +29,10 @@ mod tests {
 
     #[init]
     fn init() -> Context {
-        let config =
-            cfg_select! {
-                esp32s31 => esp_hal::Config::default(),
-                _ => esp_hal::Config::default().with_cpu_clock(esp_hal::clock::CpuClock::max()),
-            };
+        let config = cfg_select! {
+            esp32s31 => esp_hal::Config::default(),
+            _ => esp_hal::Config::default().with_cpu_clock(esp_hal::clock::CpuClock::max()),
+        };
         let peripherals = esp_hal::init(config);
 
         let (rx, tx) = hil_test::common_test_pins!(peripherals);
@@ -161,13 +160,12 @@ mod tests {
         // working as expected. We will also using different clock sources
         // while we're at it.
 
-        let fastest_clock_source =
-            cfg_select! {
-                esp32c2 => ClockSource::PllF40m,
-                any(esp32c5, esp32c6, esp32c61, esp32p4, esp32s31) => ClockSource::PllF80m,
-                esp32h2 => ClockSource::PllF48m,
-                _ => ClockSource::Apb,
-            };
+        let fastest_clock_source = cfg_select! {
+            esp32c2 => ClockSource::PllF40m,
+            any(esp32c5, esp32c6, esp32c61, esp32p4, esp32s31) => ClockSource::PllF80m,
+            any(esp32h2, esp32h4) => ClockSource::PllF48m,
+            _ => ClockSource::Apb,
+        };
 
         let configs = [
             #[cfg(not(soc_has_clock_node_ref_tick))]
@@ -245,36 +243,12 @@ mod tests {
     }
 
     #[test]
-    fn test_break_detection(ctx: Context) {
-        let mut tx = ctx.uart0.split().1.with_tx(ctx.tx);
-        let mut rx = ctx.uart1.split().0.with_rx(ctx.rx);
-
-        tx.send_break(100);
-        assert!(rx.wait_for_break_with_timeout(Duration::from_secs(1)));
-    }
-
-    #[test]
-    fn test_break_detection_no_break(ctx: Context) {
-        let mut rx = ctx.uart1.split().0.with_rx(ctx.rx);
-
-        assert!(!rx.wait_for_break_with_timeout(Duration::from_millis(100)));
-    }
-
-    #[test]
-    fn test_break_detection_multiple(ctx: Context) {
-        let mut tx = ctx.uart0.split().1.with_tx(ctx.tx);
-        let mut rx = ctx.uart1.split().0.with_rx(ctx.rx);
-
-        for _ in 0..3 {
-            tx.send_break(100);
-            assert!(rx.wait_for_break_with_timeout(Duration::from_secs(1)));
-        }
-    }
-
-    #[test]
     fn test_break_detection_interleaved(ctx: Context) {
         let mut tx = ctx.uart0.split().1.with_tx(ctx.tx);
         let mut rx = ctx.uart1.split().0.with_rx(ctx.rx);
+
+        // Initially, there is no break
+        assert!(!rx.wait_for_break_with_timeout(Duration::from_millis(100)));
 
         // Test 1: Send break, expect detection
         tx.send_break(100);
@@ -287,10 +261,7 @@ mod tests {
         tx.send_break(100);
         assert!(rx.wait_for_break_with_timeout(Duration::from_secs(1)));
 
-        // Test 4: Don't send break, expect timeout again
-        assert!(!rx.wait_for_break_with_timeout(Duration::from_millis(100)));
-
-        // Test 5: Final break detection, expect detection
+        // Test 4: Repeat sending break, expect detection
         tx.send_break(100);
         assert!(rx.wait_for_break_with_timeout(Duration::from_secs(1)));
     }
@@ -407,7 +378,7 @@ mod async_tests {
         Async,
         Blocking,
         interrupt::Priority,
-        peripherals::FROM_CPU_INTR1,
+        peripherals::FROM_CPU_INTR2,
         timer::timg::TimerGroup,
         uart::{self, Uart, UartRx},
     };
@@ -415,7 +386,7 @@ mod async_tests {
     use hil_test::mk_static;
 
     struct Context {
-        interrupt: FROM_CPU_INTR1<'static>,
+        interrupt: FROM_CPU_INTR2<'static>,
         uart: Uart<'static, Async>,
     }
 
@@ -453,10 +424,10 @@ mod async_tests {
             .into_async();
 
         let timg0 = TimerGroup::new(peripherals.TIMG0);
-        esp_rtos::start(timg0.timer0, peripherals.FROM_CPU_INTR0);
+        esp_rtos::start(timg0.timer0);
 
         Context {
-            interrupt: peripherals.FROM_CPU_INTR1,
+            interrupt: peripherals.FROM_CPU_INTR2,
             uart,
         }
     }
@@ -485,7 +456,7 @@ mod async_tests {
         let (rx, mut tx) = ctx.uart.into_blocking().split();
 
         let interrupt_executor =
-            mk_static!(InterruptExecutor<1>, InterruptExecutor::new(ctx.interrupt));
+            mk_static!(InterruptExecutor<2>, InterruptExecutor::new(ctx.interrupt));
 
         let signal = &*mk_static!(Signal<CriticalSectionRawMutex, ()>, Signal::new());
 
@@ -569,7 +540,7 @@ mod async_tx_rx {
         let (rx, tx) = hil_test::common_test_pins!(peripherals);
 
         let timg0 = TimerGroup::new(peripherals.TIMG0);
-        esp_rtos::start(timg0.timer0, peripherals.FROM_CPU_INTR0);
+        esp_rtos::start(timg0.timer0);
 
         let tx = UartTx::new(peripherals.UART0, uart::Config::default())
             .unwrap()
@@ -903,7 +874,7 @@ mod async_tx_rx_split {
         let (rx, tx) = hil_test::common_test_pins!(peripherals);
 
         let timg0 = TimerGroup::new(peripherals.TIMG0);
-        esp_rtos::start(timg0.timer0, peripherals.FROM_CPU_INTR0);
+        esp_rtos::start(timg0.timer0);
 
         let (rx, tx) = Uart::new(peripherals.UART0, uart::Config::default())
             .unwrap()
@@ -1003,7 +974,7 @@ mod uhci {
     #[test]
     fn test_send_receive(ctx: Context) {
         let timg0 = TimerGroup::new(ctx.peripherals.TIMG0);
-        esp_rtos::start(timg0.timer0, ctx.peripherals.FROM_CPU_INTR0);
+        esp_rtos::start(timg0.timer0);
 
         let (rx, tx) = hil_test::common_test_pins!(ctx.peripherals);
         let uart = Uart::new(ctx.peripherals.UART0, uart::Config::default())
@@ -1060,7 +1031,7 @@ mod uhci {
     #[test]
     fn test_long_strings(ctx: Context) {
         let timg0 = TimerGroup::new(ctx.peripherals.TIMG0);
-        esp_rtos::start(timg0.timer0, ctx.peripherals.FROM_CPU_INTR0);
+        esp_rtos::start(timg0.timer0);
 
         let (rx, tx) = hil_test::common_test_pins!(ctx.peripherals);
         let uart = Uart::new(ctx.peripherals.UART0, uart::Config::default())
@@ -1117,7 +1088,7 @@ mod uhci {
     #[test]
     async fn test_send_receive_async(ctx: Context) {
         let timg0 = TimerGroup::new(ctx.peripherals.TIMG0);
-        esp_rtos::start(timg0.timer0, ctx.peripherals.FROM_CPU_INTR0);
+        esp_rtos::start(timg0.timer0);
 
         let (rx, tx) = hil_test::common_test_pins!(ctx.peripherals);
         let uart = Uart::new(ctx.peripherals.UART0, uart::Config::default())
@@ -1176,7 +1147,7 @@ mod uhci {
     #[test]
     async fn test_long_strings_async(ctx: Context) {
         let timg0 = TimerGroup::new(ctx.peripherals.TIMG0);
-        esp_rtos::start(timg0.timer0, ctx.peripherals.FROM_CPU_INTR0);
+        esp_rtos::start(timg0.timer0);
 
         let (rx, tx) = hil_test::common_test_pins!(ctx.peripherals);
         let uart = Uart::new(ctx.peripherals.UART0, uart::Config::default())
@@ -1324,7 +1295,7 @@ mod new_tests {
         );
 
         let timg0 = TimerGroup::new(p.TIMG0);
-        esp_rtos::start(timg0.timer0, p.FROM_CPU_INTR0);
+        esp_rtos::start(timg0.timer0);
 
         let (rx, tx) = hil_test::common_test_pins!(p);
 
@@ -1372,6 +1343,77 @@ mod new_tests {
 
     #[test]
     #[timeout(10)]
+    fn applying_config_does_not_cause_a_pulse(mut ctx: Context) {
+        fn inner(
+            tx_instance: usize,
+            rx: AnyUart<'_>,
+            rx_pin: AnyPin<'_>,
+            tx: AnyUart<'_>,
+            tx_pin: AnyPin<'_>,
+        ) {
+            info!("Testing UART{}", tx_instance);
+
+            let config = uart::Config::default();
+            let mut rx = Uart::new(rx, config).unwrap().with_rx(rx_pin);
+            let mut uart = Uart::new(tx, config).unwrap().with_tx(tx_pin);
+
+            // Applying the configuration must keep the TX line at the idle level. A low
+            // pulse on it would look like a glitch to the receiver.
+            for i in 0..20 {
+                uart.apply_config(&config).unwrap();
+
+                uart.write(b"a").unwrap();
+                uart.flush().unwrap();
+
+                let mut buf = [0u8; 1];
+                let read = rx.read(&mut buf).unwrap();
+
+                assert_eq!(
+                    &buf[..read],
+                    b"a",
+                    "UART{}: failed in iteration #{}",
+                    tx_instance,
+                    i
+                );
+            }
+
+            let (_, mut tx) = uart.split();
+
+            for i in 0..20 {
+                tx.apply_config(&config).unwrap();
+
+                tx.write(b"a").unwrap();
+                tx.flush().unwrap();
+
+                let mut buf = [0u8; 1];
+                let read = rx.read(&mut buf).unwrap();
+
+                assert_eq!(
+                    &buf[..read],
+                    b"a",
+                    "UART{}: failed in iteration #{} (transmitter only)",
+                    tx_instance,
+                    i
+                );
+            }
+
+            info!("UART{} test passed", tx_instance);
+        }
+
+        // Run the test for each UART instance
+        for_each_uart_pair(|tx_num, rx_num| {
+            inner(
+                tx_num,
+                unsafe { ctx.uart[rx_num].clone_unchecked() },
+                ctx.rx.reborrow(),
+                unsafe { ctx.uart[tx_num].clone_unchecked() },
+                ctx.tx.reborrow(),
+            );
+        });
+    }
+
+    #[test]
+    #[timeout(10)]
     fn creating_uart_clears_fifo(mut ctx: Context) {
         fn inner(
             tx_instance: usize,
@@ -1408,9 +1450,7 @@ mod new_tests {
         }
 
         // Run the test for each UART instance
-        // https://github.com/esp-rs/esp-hal/issues/6138
-        let uart_count = if cfg!(esp32) { 2 } else { UART_COUNT };
-        for (tx_num, rx_num) in (0..uart_count).map(|i| (i, (i + 1) % uart_count)) {
+        for_each_uart_pair(|tx_num, rx_num| {
             inner(
                 tx_num,
                 unsafe { ctx.uart[rx_num].clone_unchecked() },
@@ -1418,6 +1458,14 @@ mod new_tests {
                 unsafe { ctx.uart[tx_num].clone_unchecked() },
                 ctx.tx.reborrow(),
             );
+        });
+    }
+
+    fn for_each_uart_pair(mut f: impl FnMut(usize, usize)) {
+        // https://github.com/esp-rs/esp-hal/issues/6138
+        let uart_count = if cfg!(esp32) { 2 } else { UART_COUNT };
+        for (tx_num, rx_num) in (0..uart_count).map(|i| (i, (i + 1) % uart_count)) {
+            f(tx_num, rx_num);
         }
     }
 

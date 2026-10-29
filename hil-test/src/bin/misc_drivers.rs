@@ -1,9 +1,12 @@
 //! Interrupt Tests
 //!     "Disabled" for now - see https://github.com/esp-rs/esp-hal/pull/1635#issuecomment-2137405251
+//! MCPWM Tests
 //! PCNT Tests
 //! RNG Tests
+//! SDMMC Tests
 //! System Timer Tests
 //! TWAI Tests
+//! Debug Assist Tests
 //% CHIP_FILTER: gpio_driver_supported
 //% FEATURES: unstable embassy
 
@@ -18,11 +21,24 @@ mod pcnt {
     use esp_hal::{
         delay::Delay,
         gpio::{AnyPin, Input, InputConfig, Level, Output, OutputConfig, Pin, Pull},
-        pcnt::{Pcnt, channel::EdgeMode},
+        handler,
+        pcnt::{Unit, channel::EdgeMode},
+        time::{Duration, Instant},
     };
+    use portable_atomic::{AtomicUsize, Ordering};
+
+    static HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    #[handler]
+    fn count_calls() {
+        HANDLER_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
 
     struct Context<'d> {
-        pcnt: Pcnt<'d>,
+        unit0: Unit<'d>,
+        unit1: Unit<'d>,
+        unit2: Unit<'d>,
+        unit3: Unit<'d>,
         input: AnyPin<'d>,
         output: AnyPin<'d>,
         delay: Delay,
@@ -37,7 +53,10 @@ mod pcnt {
         let dout = dout.degrade();
 
         Context {
-            pcnt: Pcnt::new(peripherals.PCNT),
+            unit0: Unit::new(peripherals.PCNT0_UNIT0),
+            unit1: Unit::new(peripherals.PCNT0_UNIT1),
+            unit2: Unit::new(peripherals.PCNT0_UNIT2),
+            unit3: Unit::new(peripherals.PCNT0_UNIT3),
             input: din,
             output: dout,
             delay: Delay::new(),
@@ -46,7 +65,7 @@ mod pcnt {
 
     #[test]
     fn test_increment_on_pos_edge(ctx: Context<'static>) {
-        let unit = ctx.pcnt.unit0;
+        let unit = ctx.unit0;
 
         // Setup channel 0 to increment the count when input changes LOW -> HIGH
         unit.channel0.set_edge_signal(Input::new(
@@ -85,7 +104,7 @@ mod pcnt {
 
     #[test]
     fn test_increment_on_neg_edge(ctx: Context<'static>) {
-        let unit = ctx.pcnt.unit1;
+        let unit = ctx.unit1;
 
         // Setup channel 0 to increment the count when input changes HIGH -> LOW
         unit.channel0.set_edge_signal(Input::new(
@@ -124,7 +143,7 @@ mod pcnt {
 
     #[test]
     fn test_increment_past_high_limit(ctx: Context<'static>) {
-        let unit = ctx.pcnt.unit3;
+        let unit = ctx.unit3;
 
         unit.set_high_limit(Some(3)).unwrap();
 
@@ -184,7 +203,7 @@ mod pcnt {
 
     #[test]
     fn test_increment_past_thresholds(ctx: Context<'static>) {
-        let unit = ctx.pcnt.unit0;
+        let unit = ctx.unit0;
 
         unit.set_threshold0(Some(2));
         unit.set_threshold1(Some(4));
@@ -252,7 +271,7 @@ mod pcnt {
 
     #[test]
     fn test_decrement_past_low_limit(ctx: Context<'static>) {
-        let unit = ctx.pcnt.unit0;
+        let unit = ctx.unit0;
 
         unit.set_low_limit(Some(-3)).unwrap();
         // For some reason this is needed for the above limit to apply.
@@ -314,7 +333,7 @@ mod pcnt {
 
     #[test]
     fn test_unit_count_range(ctx: Context<'static>) {
-        let unit = ctx.pcnt.unit2;
+        let unit = ctx.unit2;
 
         // Setup channel 1 to increment the count when gpio2 does LOW -> HIGH
         unit.channel1.set_edge_signal(Input::new(
@@ -353,6 +372,139 @@ mod pcnt {
             output.set_high();
             ctx.delay.delay_micros(1);
         }
+    }
+
+    #[test]
+    fn test_unit_counts_after_previous_unit_dropped(ctx: Context<'static>) {
+        let input = Input::new(ctx.input, InputConfig::default().with_pull(Pull::Down));
+        let mut output = Output::new(ctx.output, Level::Low, OutputConfig::default());
+
+        let unit = ctx.unit0;
+        unit.channel0.set_edge_signal(input.peripheral_input());
+        unit.channel0
+            .set_input_mode(EdgeMode::Hold, EdgeMode::Increment);
+
+        output.set_high();
+        ctx.delay.delay_micros(1);
+        assert_eq!(1, unit.value());
+
+        core::mem::drop(unit);
+        output.set_low();
+        ctx.delay.delay_micros(1);
+
+        // A unit built from a fresh singleton must count without an explicit resume,
+        // the same as after a cold boot.
+        let unit = Unit::new(unsafe { esp_hal::peripherals::PCNT0_UNIT0::steal() });
+        unit.channel0.set_edge_signal(input.peripheral_input());
+        unit.channel0
+            .set_input_mode(EdgeMode::Hold, EdgeMode::Increment);
+
+        assert_eq!(0, unit.value());
+
+        output.set_high();
+        ctx.delay.delay_micros(1);
+
+        assert_eq!(1, unit.value());
+    }
+
+    #[test]
+    fn test_listening_unit_without_handler_does_not_stall_the_cpu(ctx: Context<'static>) {
+        let input = Input::new(ctx.input, InputConfig::default().with_pull(Pull::Down));
+        let mut output = Output::new(ctx.output, Level::Low, OutputConfig::default());
+
+        let mut unit0 = ctx.unit0;
+        unit0.set_interrupt_handler(count_calls);
+
+        let unit1 = ctx.unit1;
+        unit1.channel0.set_edge_signal(input.peripheral_input());
+        unit1
+            .channel0
+            .set_input_mode(EdgeMode::Hold, EdgeMode::Increment);
+        unit1.set_high_limit(Some(1)).unwrap();
+        unit1.clear();
+        unit1.listen();
+
+        output.set_high();
+
+        let deadline = Instant::now() + Duration::from_millis(50);
+        while Instant::now() < deadline {}
+
+        assert_eq!(0, HANDLER_CALLS.load(Ordering::Relaxed));
+        assert!(unit0.value() == 0);
+    }
+}
+
+#[cfg(all(mcpwm_driver_supported, pcnt_driver_supported))]
+#[embedded_test::tests(default_timeout = 3)]
+mod mcpwm {
+    use esp_hal::{
+        delay::Delay,
+        gpio::{AnyPin, Input, InputConfig, Pin, Pull},
+        mcpwm::{McPwm, PeripheralClockConfig, operator::PwmPinConfig, timer::PwmWorkingMode},
+        pcnt::{Unit, channel::EdgeMode},
+        peripherals::MCPWM0,
+        time::Rate,
+    };
+
+    struct Context<'d> {
+        mcpwm: MCPWM0<'d>,
+        unit: Unit<'d>,
+        input: AnyPin<'d>,
+        output: AnyPin<'d>,
+        delay: Delay,
+    }
+
+    #[init]
+    fn init() -> Context<'static> {
+        let peripherals = esp_hal::init(esp_hal::Config::default());
+
+        let (din, dout) = hil_test::common_test_pins!(peripherals);
+
+        Context {
+            mcpwm: peripherals.MCPWM0,
+            unit: Unit::new(peripherals.PCNT0_UNIT0),
+            input: din.degrade(),
+            output: dout.degrade(),
+            delay: Delay::new(),
+        }
+    }
+
+    #[test]
+    fn output_frequency_follows_peripheral_clock_prescaler(ctx: Context<'static>) {
+        // Divide the source clock by 8. On chips that divide the group clock in the PCR, the
+        // divider resets to 5, so this tells "prescaler applied" from "reset value left in place".
+        let clock_cfg = PeripheralClockConfig::with_prescaler(7);
+
+        let mut mcpwm = McPwm::new(ctx.mcpwm, clock_cfg);
+        mcpwm.operator0.set_timer(&mcpwm.timer0);
+        let mut pwm_pin = mcpwm
+            .operator0
+            .with_pin_a(ctx.output, PwmPinConfig::UP_ACTIVE_HIGH);
+        pwm_pin.set_timestamp(50);
+
+        // 10 kHz is an exact divisor of the peripheral clock on every chip with MCPWM.
+        let timer_clock_cfg = clock_cfg
+            .timer_clock_with_frequency(99, PwmWorkingMode::Increase, Rate::from_khz(10))
+            .unwrap();
+
+        let unit = ctx.unit;
+        unit.channel0.set_edge_signal(Input::new(
+            ctx.input,
+            InputConfig::default().with_pull(Pull::Down),
+        ));
+        unit.channel0
+            .set_input_mode(EdgeMode::Hold, EdgeMode::Increment);
+
+        mcpwm.timer0.start(timer_clock_cfg);
+
+        // 10 ms at 10 kHz is 100 rising edges.
+        unit.clear();
+        unit.resume();
+        ctx.delay.delay_millis(10);
+        unit.pause();
+
+        let edges = unit.value();
+        hil_test::assert!((98..=102).contains(&edges), "counted {} edges", edges);
     }
 }
 
@@ -585,6 +737,81 @@ mod twai {
             assert_eq!(frame.data(), &[1, 2, 3])
         }
 
+        #[test]
+        // The receive FIFO holds 64 bytes, four 8-byte standard frames; later
+        // frames overrun it. A blocking receiver must see the overrun once
+        // and then an empty FIFO, not the same overrun entry for ever.
+        fn test_blocking_receive_releases_overrun(mut ctx: Context<Blocking>) {
+            let frame = EspTwaiFrame::new_self_reception(StandardId::ZERO, b"12345678").unwrap();
+
+            const SENT: usize = 10;
+            for _ in 0..SENT {
+                block!(ctx.twai.transmit(&frame)).unwrap();
+            }
+
+            let mut frames = 0;
+            let mut overruns = 0;
+            loop {
+                match ctx.twai.receive() {
+                    Ok(received) => {
+                        assert_eq!(received.data(), b"12345678");
+                        frames += 1;
+                    }
+                    Err(nb::Error::Other(twai::EspTwaiError::EmbeddedHAL(ErrorKind::Overrun))) => {
+                        overruns += 1;
+                    }
+                    Err(nb::Error::WouldBlock) => break,
+                    Err(nb::Error::Other(err)) => panic!("{:?}", err),
+                }
+                assert!(frames + overruns <= SENT, "the same overrun reported again");
+            }
+
+            assert!(frames > 0, "no frame received");
+            assert!(overruns > 0, "no overrun reported");
+            assert!(frames < SENT, "the FIFO did not overrun");
+        }
+
+        #[test]
+        // A stopped driver takes a new bitrate and operating mode, and starts
+        // again with them.
+        fn test_reconfigure_stopped_driver(ctx: Context<Blocking>) {
+            let frame = EspTwaiFrame::new_self_reception(StandardId::ZERO, &[1, 2, 3]).unwrap();
+
+            // Normal mode: nobody acknowledges on the loopback pin, so the
+            // frame is retried until the peripheral turns error passive and
+            // the driver gives up on it. In self-test mode it would have been
+            // sent.
+            let mut config = ctx.twai.stop();
+            config.set_operating_mode(TwaiMode::Normal);
+            config.set_baud_rate(twai::BaudRate::B500K);
+            let mut twai = config.start();
+
+            block!(twai.transmit(&frame)).unwrap();
+            assert_eq!(
+                block!(twai.transmit(&frame)),
+                Err(twai::EspTwaiError::TransmissionAborted)
+            );
+            assert!(twai.transmit_error_count() >= 128);
+            assert!(
+                twai.receive().is_err(),
+                "an unacknowledged frame was received"
+            );
+
+            // Back to self-test mode at another bitrate: the frame loops back
+            let mut config = twai.stop();
+            config.set_operating_mode(TwaiMode::SelfTest);
+            config.set_baud_rate(twai::BaudRate::B250K);
+            let mut twai = config.start();
+
+            let (rx, tx) = twai.split_mut();
+            block!(tx.transmit(&frame)).unwrap();
+            let received = block!(rx.receive()).unwrap();
+            assert_eq!(received.data(), &[1, 2, 3]);
+
+            // The borrowed halves are gone: the driver can be stopped again
+            let _config = twai.stop();
+        }
+
         fn no_init() {}
 
         #[test(init = no_init)]
@@ -642,7 +869,7 @@ mod twai {
 
             let timg0 = TimerGroup::new(peripherals.TIMG0);
 
-            esp_rtos::start(timg0.timer0, peripherals.FROM_CPU_INTR0);
+            esp_rtos::start(timg0.timer0);
 
             let twai = config.into_async().start();
 
@@ -703,6 +930,38 @@ mod twai {
             receive_frames(&mut ctx, NUM_SENT_FRAMES + NUM_ASYNC_SENT_FRAMES).await;
         }
 
+        #[test]
+        async fn test_overruns_are_counted(mut ctx: Context<Async>) {
+            let frame =
+                EspTwaiFrame::new_self_reception(StandardId::new(0).unwrap(), b"12345678").unwrap();
+
+            // Nothing drains the receive FIFO while the interrupt is off, so
+            // it overruns
+            interrupt::disable(Cpu::ProCpu, TWAI0);
+            const SENT: usize = 10;
+            for _ in 0..SENT {
+                block!(ctx.twai.transmit(&frame)).unwrap();
+            }
+            interrupt::enable(TWAI0, Priority3);
+
+            // Let the handler run, then take everything it queued
+            transmit_frames(&mut ctx, &frame, 1).await;
+            let mut overruns = 0;
+            for _ in 0..SENT + 1 {
+                match ctx.twai.receive_async().await {
+                    Ok(_) => {}
+                    Err(esp_hal::twai::EspTwaiError::EmbeddedHAL(ErrorKind::Overrun)) => {
+                        overruns += 1
+                    }
+                    Err(err) => panic!("{:#?}", err),
+                }
+            }
+
+            assert!(overruns > 0, "the FIFO did not overrun");
+            assert_eq!(ctx.twai.error_counts().overrun, overruns);
+            assert_eq!(ctx.twai.error_counts().bit, 0);
+        }
+
         fn no_init() {}
 
         #[test(init = no_init)]
@@ -711,7 +970,7 @@ mod twai {
             let peripherals = esp_hal::init(esp_hal::Config::default());
 
             let timg0 = TimerGroup::new(peripherals.TIMG0);
-            esp_rtos::start(timg0.timer0, peripherals.FROM_CPU_INTR0);
+            esp_rtos::start(timg0.timer0);
 
             // The bus is permanently recessive, so every transmission attempt
             // fails immediately (a transmitted dominant bit reads back
@@ -734,6 +993,12 @@ mod twai {
                 twai.transmit_async(&frame).await,
                 Err(twai::EspTwaiError::TransmissionAborted)
             );
+
+            // Every attempt read its first dominant bit back recessive: bit
+            // errors, one per attempt until the controller went error passive
+            let counts = twai.error_counts();
+            assert!(counts.bit > 0, "{:?}", counts);
+            assert_eq!(counts.acknowledge, 0, "{:?}", counts);
         }
     }
 }
@@ -765,5 +1030,252 @@ mod lp_timekeeping {
             "RTC only advanced by {:?}",
             rtc_duration
         );
+    }
+}
+
+#[cfg(assist_debug_has_region_monitor)]
+#[embedded_test::tests(default_timeout = 3)]
+mod assist_debug {
+    #[cfg(all(multi_core, soc_has_cpu_ctrl))]
+    use core::hint::spin_loop;
+    use core::ptr::addr_of;
+
+    #[cfg(all(multi_core, soc_has_cpu_ctrl))]
+    use esp_hal::system::{CpuControl, Stack};
+    use esp_hal::{assist_debug::DebugAssist, peripherals::Peripherals};
+    use hil_test::mk_static;
+
+    #[esp_hal::ram]
+    fn monitored_write(address: u32) {
+        unsafe { (address as *mut u32).write_volatile(0x1234_5678) };
+    }
+
+    fn assert_pc_in_ram(pc: u32) {
+        unsafe extern "C" {
+            static _rwtext_start: u8;
+            static _rwtext_end: u8;
+        }
+
+        let code = addr_of!(_rwtext_start) as u32..addr_of!(_rwtext_end) as u32;
+        assert!(
+            code.contains(&pc),
+            "captured PC {pc:#x} is outside RAM code"
+        );
+    }
+
+    #[init]
+    fn init() -> Peripherals {
+        esp_hal::init(esp_hal::Config::default())
+    }
+
+    #[test]
+    fn region_monitor_pc(p: Peripherals) {
+        let address = mk_static!(u32, 0) as *mut u32 as u32;
+        let mut da = DebugAssist::new(p.ASSIST_DEBUG);
+        da.enable_region0_monitor(address, address + size_of::<u32>() as u32, false, true);
+
+        monitored_write(address);
+        assert!(da.is_region0_monitor_interrupt_set());
+        let pc = da.region_monitor_pc();
+        da.disable_region0_monitor();
+        da.clear_region0_monitor_interrupt();
+
+        assert_pc_in_ram(pc);
+    }
+
+    #[cfg(all(multi_core, soc_has_cpu_ctrl))]
+    #[test]
+    fn core1_region_monitor_pc(p: Peripherals) {
+        let address = mk_static!(u32, 0) as *mut u32 as u32;
+        let mut da = DebugAssist::new(p.ASSIST_DEBUG);
+        da.enable_core1_region0_monitor(address, address + size_of::<u32>() as u32, false, true);
+
+        let mut cpu_control = CpuControl::new(p.CPU_CTRL);
+        let stack = mk_static!(Stack<8192>, Stack::new());
+        let _guard = cpu_control
+            .start_app_core(stack, move || {
+                monitored_write(address);
+                loop {
+                    spin_loop();
+                }
+            })
+            .unwrap();
+
+        while !da.is_core1_region0_monitor_interrupt_set() {
+            spin_loop();
+        }
+        let pc = da.core1_region_monitor_pc();
+        da.disable_core1_region0_monitor();
+        da.clear_core1_region0_monitor_interrupt();
+
+        assert_pc_in_ram(pc);
+    }
+}
+
+#[cfg(esp32p4)]
+#[embedded_test::tests(default_timeout = 10, executor = hil_test::Executor::new())]
+mod sdmmc {
+    use block_device_adapters::BufStream;
+    use embassy_time::Delay;
+    use embedded_fatfs::{FileSystem, FsOptions, ReadWriteSeek};
+    use embedded_io_async::{Read, Seek, SeekFrom, Write};
+    use embedded_partitions::mbr::Scheme;
+    use esp_hal::{
+        Async,
+        sdmmc::{Config, DelayPhase, SdHostController, Slot, SlotConfig},
+        timer::timg::TimerGroup,
+    };
+    use hil_test::mk_static;
+    use sdio::{BlockDevice, sd::Card};
+
+    type SdCard = BlockDevice<Card, Slot<'static, 0, Async>, Delay, 512>;
+
+    const CARD_HZ: u32 = 40_000_000;
+
+    // The test writes the file only when it is missing, to limit wear on the card.
+    const TEST_FILE: &str = "ESPHIL.TXT";
+
+    // Spans several 512-byte blocks, so reads use the multi-block path.
+    const FILE_LEN: usize = 2048;
+
+    // The prime modulus keeps the pattern from lining up with block boundaries.
+    const fn pattern_byte(i: usize) -> u8 {
+        (i % 251) as u8
+    }
+
+    fn expected() -> [u8; FILE_LEN] {
+        core::array::from_fn(pattern_byte)
+    }
+
+    #[derive(Clone, Copy)]
+    enum ReadMethod {
+        ReadToEnd,
+        ReadExact,
+        Chunked,
+        Seek,
+    }
+
+    #[init]
+    async fn init() -> SdCard {
+        let peripherals = esp_hal::init(esp_hal::Config::default());
+
+        let timg0 = TimerGroup::new(peripherals.TIMG0);
+        esp_rtos::start(timg0.timer0);
+
+        let controller = mk_static!(
+            SdHostController<'static>,
+            SdHostController::new(peripherals.SDHOST, Config::default()).unwrap()
+        );
+        let slot = controller
+            .slot::<0>(SlotConfig::default().with_input_delay_phase(DelayPhase::_0))
+            .unwrap()
+            .with_clk(peripherals.GPIO43)
+            .with_cmd(peripherals.GPIO44)
+            .with_data0(peripherals.GPIO39)
+            .with_data1(peripherals.GPIO40)
+            .with_data2(peripherals.GPIO41)
+            .with_data3(peripherals.GPIO42)
+            .into_async();
+
+        BlockDevice::new_sd_card(slot, CARD_HZ, Delay)
+            .await
+            .unwrap()
+    }
+
+    async fn run_on_volume(card: &mut SdCard, method: ReadMethod) {
+        let stream = BufStream::<_, 512>::new(card);
+        match Scheme::open(stream).await.unwrap() {
+            Scheme::Mbr(mut mbr) => {
+                let idx = mbr
+                    .iter_used()
+                    .find(|(_, p)| p.is_fat())
+                    .map(|(i, _)| i)
+                    .expect("no FAT partition found");
+                check_file(mbr.open_partition(idx).await.unwrap(), method).await;
+            }
+            Scheme::Superfloppy(io) => check_file(io, method).await,
+            Scheme::Unknown(_) => panic!("unrecognised volume layout"),
+        }
+    }
+
+    async fn check_file<IO: ReadWriteSeek>(io: IO, method: ReadMethod) {
+        let expected = expected();
+        let fs = FileSystem::new(io, FsOptions::new()).await.unwrap();
+        {
+            let root = fs.root_dir();
+
+            match root.open_file(TEST_FILE).await {
+                Ok(_) => {}
+                Err(embedded_fatfs::Error::NotFound) => {
+                    let mut file = root.create_file(TEST_FILE).await.unwrap();
+                    file.write_all(&expected).await.unwrap();
+                    file.flush().await.unwrap();
+                }
+                Err(e) => panic!("open_file failed: {:?}", e),
+            }
+
+            let mut file = root.open_file(TEST_FILE).await.unwrap();
+            let mut buf = [0u8; FILE_LEN + 1];
+            match method {
+                ReadMethod::ReadToEnd => {
+                    let mut len = 0;
+                    loop {
+                        match file.read(&mut buf[len..]).await.unwrap() {
+                            0 => break,
+                            n => len += n,
+                        }
+                    }
+                    assert_eq!(len, FILE_LEN);
+                    assert_eq!(&buf[..len], &expected[..]);
+                }
+                ReadMethod::ReadExact => {
+                    file.read_exact(&mut buf[..FILE_LEN]).await.unwrap();
+                    assert_eq!(&buf[..FILE_LEN], &expected[..]);
+                    assert_eq!(file.read(&mut buf).await.unwrap(), 0);
+                }
+                ReadMethod::Chunked => {
+                    // 100 bytes does not divide the block size, so chunks cross block boundaries.
+                    for (i, chunk) in buf[..FILE_LEN].chunks_mut(100).enumerate() {
+                        file.read_exact(chunk).await.unwrap();
+                        let start = i * 100;
+                        assert_eq!(chunk, &expected[start..start + chunk.len()]);
+                    }
+                }
+                ReadMethod::Seek => {
+                    file.seek(SeekFrom::Start(700)).await.unwrap();
+                    file.read_exact(&mut buf[..1000]).await.unwrap();
+                    assert_eq!(&buf[..1000], &expected[700..1700]);
+
+                    file.seek(SeekFrom::End(-10)).await.unwrap();
+                    file.read_exact(&mut buf[..10]).await.unwrap();
+                    assert_eq!(&buf[..10], &expected[FILE_LEN - 10..]);
+
+                    file.seek(SeekFrom::Start(0)).await.unwrap();
+                    file.read_exact(&mut buf[..10]).await.unwrap();
+                    assert_eq!(&buf[..10], &expected[..10]);
+                }
+            }
+        }
+        fs.unmount().await.unwrap();
+    }
+
+    #[test]
+    async fn read_to_end(mut card: SdCard) {
+        run_on_volume(&mut card, ReadMethod::ReadToEnd).await;
+    }
+
+    #[test]
+    async fn read_exact(mut card: SdCard) {
+        run_on_volume(&mut card, ReadMethod::ReadExact).await;
+    }
+
+    #[test]
+    async fn read_in_chunks(mut card: SdCard) {
+        run_on_volume(&mut card, ReadMethod::Chunked).await;
+    }
+
+    #[test]
+    async fn seek_and_read(mut card: SdCard) {
+        run_on_volume(&mut card, ReadMethod::Seek).await;
     }
 }
