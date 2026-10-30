@@ -1642,6 +1642,8 @@ pub(crate) fn send(data: &[u8]) {
 /// Sends an HCI packet (H4 indicator byte first) to the controller.
 ///
 /// Used by the external NPL based host (e.g. `esp-nimble-host`) to forward its HCI traffic.
+///
+/// Fork-only: upstream keeps HCI sending crate-private (`send`); esp-nimble-host needs it public.
 #[cfg(feature = "ble-host-npl")]
 pub fn send_hci(data: &[u8]) {
     send_packet(data)
