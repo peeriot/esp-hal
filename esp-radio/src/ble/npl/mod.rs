@@ -25,6 +25,8 @@ use crate::{
 #[cfg_attr(esp32c61, path = "os_adapter_esp32c61.rs")]
 #[cfg_attr(esp32h2, path = "os_adapter_esp32h2.rs")]
 pub(crate) mod chip_specific;
+// esp-nimble-host brings NimBLE's own os_mempool.c, patched to zero blocks on allocation.
+#[cfg(not(feature = "ble-host-npl"))]
 mod os_mempool;
 
 const EVENT_QUEUE_SIZE: usize = 16;
