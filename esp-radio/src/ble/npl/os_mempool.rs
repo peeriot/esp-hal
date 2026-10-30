@@ -309,6 +309,10 @@ pub unsafe extern "C" fn os_memblock_get(mp: *mut OsMempool) -> *mut u8 {
         } else {
             let block = (*mp).first.cast_mut();
             (*mp).first = (*block.cast::<OsMemblock>()).next.cast();
+            // Hand out the block without the free-list link in its first word:
+            // `ble_npl_event_init` reads a non-zero first word as an
+            // initialised event and would run the stale link as its callback.
+            (*block.cast::<OsMemblock>()).next = ptr::null_mut();
             (*mp).mp_num_free -= 1;
             if (*mp).mp_min_free > (*mp).mp_num_free {
                 (*mp).mp_min_free = (*mp).mp_num_free;
