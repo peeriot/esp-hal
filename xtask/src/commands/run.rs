@@ -1,47 +1,51 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
     process::Command,
 };
 
-use anyhow::{Context as _, Result, bail};
-use clap::{Args, Subcommand};
+use anyhow::{Context as _, Result, anyhow, bail};
+use clap::Args;
 use serde::Deserialize;
+use strum::IntoEnumIterator as _;
 
-use super::{DocTestArgs, ExamplesArgs, TestsArgs};
+use super::tests::SKIPPED_SELECTORS_FILENAME;
 use crate::{
     Package,
     cargo::{CargoAction, CargoArgsBuilder},
     firmware::{self, Metadata},
     metadata::Chip,
     radio_hil_runner::run_radio_test_elf,
+    resolve::{ResolveInput, resolve},
 };
 
 // ----------------------------------------------------------------------------
-// Subcommands
+// Command Arguments
 
-#[derive(Debug, Subcommand)]
-pub enum Run {
-    /// Run doctests for specified chip and package.
-    DocTests(DocTestArgs),
-    /// Run all ELFs in a folder.
-    Elfs(RunElfsArgs),
-    /// Run the given example for the specified chip.
-    Example(ExamplesArgs),
-    /// Run all applicable tests or the specified test for a specified chip.
-    Tests(TestsArgs),
+/// Arguments common to commands which act on doctests.
+#[cfg_attr(
+    feature = "mcp",
+    xtask_mcp_macros::mcp_tool(
+        description = "Run doc tests for the specified chip and packages",
+        command = "doc-tests"
+    )
+)]
+#[derive(Debug, Args)]
+pub struct DocTestArgs {
+    /// Chip and/or package, in any order. Doc tests run on one chip, so the chip is required.
+    pub tokens: Vec<String>,
+    /// Package(s) where we wish to run doc tests. Accepts the same names the tokens do.
+    #[arg(long, alias = "package", value_enum, value_delimiter = ',')]
+    pub packages: Vec<Package>,
 }
-
-// ----------------------------------------------------------------------------
-// Subcommand Arguments
 
 /// Arguments for running ELFs.
 #[cfg_attr(
     feature = "mcp",
     xtask_mcp_macros::mcp_tool(
         description = "Run all ELFs in a folder using probe-rs. Use --filter binary or binary::test_name to select which ELFs/tests run.",
-        command = "run elfs"
+        command = "elfs"
     )
 )]
 #[derive(Debug, Args)]
@@ -63,9 +67,24 @@ pub struct RunElfsArgs {
 
 /// Run doc tests for the specified package and chip.
 pub fn run_doc_tests(workspace: &Path, args: DocTestArgs) -> Result<()> {
+    let mut input = ResolveInput::from_tokens(args.tokens);
+    input.packages = args.packages;
+    let resolution = resolve(input);
+    if !resolution.names.is_empty() {
+        bail!("Unknown argument: {}", resolution.names.join(", "));
+    }
+    let [chip] = resolution.chips[..] else {
+        bail!("Name exactly one chip to run doc tests for");
+    };
+    let packages = if resolution.packages.is_empty() {
+        Package::iter().collect()
+    } else {
+        resolution.packages
+    };
+
     let mut success = true;
-    for package in args.packages {
-        success &= run_doc_tests_for_package(workspace, package, args.chip)?;
+    for package in packages {
+        success &= run_doc_tests_for_package(workspace, package, chip)?;
     }
     anyhow::ensure!(success, "One or more doc tests failed");
     Ok(())
@@ -92,8 +111,7 @@ pub fn run_doc_tests_for_package(workspace: &Path, package: Package, chip: Chip)
         return Ok(true);
     };
 
-    let package_name = package.to_string();
-    let package_path = crate::windows_safe_path(&workspace.join(&package_name));
+    let package_path = crate::windows_safe_path(&workspace.join(package.directory()));
 
     if package.has_chip_features() {
         doc_config.features.push(chip.to_string());
@@ -150,10 +168,10 @@ pub fn run_elfs(args: RunElfsArgs) -> Result<()> {
         if !path.is_file() {
             continue;
         }
-        if path
-            .file_name()
-            .is_some_and(|name| name == std::ffi::OsStr::new(RADIO_ELF_MANIFEST_FILENAME))
-        {
+        if path.file_name().is_some_and(|name| {
+            name == std::ffi::OsStr::new(RADIO_ELF_MANIFEST_FILENAME)
+                || name == std::ffi::OsStr::new(SKIPPED_SELECTORS_FILENAME)
+        }) {
             continue;
         }
 
@@ -301,10 +319,24 @@ pub fn run_elfs(args: RunElfsArgs) -> Result<()> {
         .filter(|(_, matched)| !**matched)
         .map(|(filter, _)| filter.raw.as_str())
         .collect::<Vec<_>>();
+    let skipped_selectors = load_skipped_selectors(&args.path)?;
+    let (skipped, unmatched): (Vec<_>, Vec<_>) = unmatched.into_iter().partition(|raw| {
+        let raw = raw.to_lowercase();
+        skipped_selectors
+            .iter()
+            .any(|name| name.to_lowercase().contains(&raw))
+    });
     if !unmatched.is_empty() {
         bail!(
             "ELF selector did not match any artifact: {}",
             unmatched.join(", ")
+        );
+    }
+    if !skipped.is_empty() {
+        log::warn!(
+            "Skipping selectors without a test for '{}': {}",
+            args.chip,
+            skipped.join(", ")
         );
     }
 
@@ -341,7 +373,10 @@ fn parse_elf_filters(raw_filters: &[String]) -> Result<Vec<ElfFilter>> {
             None => (raw, None),
         };
 
-        let binary = binary.trim().to_lowercase();
+        let mut binary = binary.trim().to_lowercase();
+        if let Some(stem) = binary.strip_suffix(".rs") {
+            binary = stem.to_string();
+        }
         if binary.is_empty() {
             bail!("Empty binary filter in ELF selector '{raw}' is not allowed");
         }
@@ -403,6 +438,18 @@ fn load_radio_test_manifest(path: &Path) -> Result<Option<HashMap<String, RadioE
     Ok(Some(by_artifact))
 }
 
+fn load_skipped_selectors(path: &Path) -> Result<HashSet<String>> {
+    let skipped_path = path.join(SKIPPED_SELECTORS_FILENAME);
+    if !skipped_path.exists() {
+        return Ok(HashSet::new());
+    }
+
+    let content = fs::read_to_string(&skipped_path)
+        .with_context(|| format!("Failed to read {}", skipped_path.display()))?;
+    serde_json::from_str(&content)
+        .with_context(|| format!("Failed to parse {}", skipped_path.display()))
+}
+
 fn resolve_harness_binary_path(elfs: &[(String, PathBuf)], harness_name: &str) -> Option<PathBuf> {
     if let Some((_, path)) = elfs.iter().find(|(name, _)| name == harness_name) {
         return Some(path.clone());
@@ -416,15 +463,17 @@ fn resolve_harness_binary_path(elfs: &[(String, PathBuf)], harness_name: &str) -
 
 /// Run the specified examples for the given chip.
 pub fn run_examples(
-    args: ExamplesArgs,
+    package: Package,
+    chip: Chip,
+    debug: bool,
+    toolchain: Option<&str>,
+    timings: bool,
     examples: Vec<Metadata>,
     package_path: &Path,
 ) -> Result<()> {
     let mut examples = examples;
 
-    // At this point, chip can never be `None`, so we can safely unwrap it.
-    let chip = args.chip.unwrap();
-    let target = args.package.as_package().target_triple(&chip)?;
+    let target = package.target_triple(&chip)?;
 
     examples.sort_by_key(|ex| ex.tag());
 
@@ -437,7 +486,7 @@ pub fn run_examples(
         log::info!("Running example '{}'", example.output_file_name());
 
         if interactive {
-            if let Some(description) = example.description() {
+            if let Some(description) = example.description_for(&target) {
                 log::info!(
                     "\n\n{}\n\nPress ENTER to run example, `s` to skip",
                     description.trim()
@@ -467,9 +516,9 @@ pub fn run_examples(
                 &target,
                 &example,
                 CargoAction::Run,
-                args.debug,
-                args.toolchain.as_deref(),
-                args.timings,
+                debug,
+                toolchain,
+                timings,
                 &[],
             );
 
@@ -481,7 +530,16 @@ pub fn run_examples(
                         let key = console.read_key();
 
                         match key {
-                            Ok(console::Key::Char('r')) => break,
+                            Ok(console::Key::Char('r')) => {
+                                // A retry looks again, so a board swapped in meanwhile is the one
+                                // to run on. Another chip is for the caller to start over for.
+                                if let Some(connected) = crate::detect::rescan_with_espflash()?
+                                    && connected != chip
+                                {
+                                    return Err(anyhow!(connected));
+                                }
+                                break;
+                            }
                             Ok(console::Key::Char('s')) => {
                                 skip = true;
                                 break;

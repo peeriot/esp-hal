@@ -17,6 +17,9 @@ trm    = "https://www.espressif.com/sites/default/files/documentation/esp32-c61_
 page_size = 0x10000
 entry_num = 512
 
+[device.flash]
+support_status = "partial"
+
 [device.rom]
 has_crc_le  = true
 has_crc_be  = true
@@ -27,6 +30,7 @@ cpu_has_branch_predictor = true
 cpu_has_csr_pc = false
 cpu_csr_prv_mode = 0x810
 cpu_mcause_mask = 0x1f
+cpu_pmp_granularity = 128
 
 has_swd_watchdog = true
 
@@ -39,11 +43,12 @@ memory_map = { ranges = [
 ] }
 
 peripherals = [
-    { name = "APB_SARADC" },
+    { name = "APB_SARADC", clock_group = "ADC" },
     # { name = "AVC" },
     { name = "ASSIST_DEBUG"},
-    { name = "CLINT" },
     { name = "CACHE" },
+    { name = "CLIC", hidden = true },
+    { name = "CLINT" },
     # { name = "CPU_APM" }, # TODO: verify we need it
     { name = "DMA" },
     { name = "ECC" },
@@ -57,7 +62,7 @@ peripherals = [
     { name = "HP_SYS" },
     { name = "I2C_ANA_MST" },
     { name = "I2C0", interrupts = { peri = "I2C_EXT0" }, stable = true, clock_group = "I2C" },
-    { name = "I2S0", interrupts = { peri = "I2S0" } },
+    { name = "I2S0", interrupts = { peri = "I2S0" }, clock_group = "I2S" },
     # { name = "IEEE802154" }, # TODO: add PAC manually later
     { name = "INTERRUPT_CORE0" },
     { name = "INTPRI" },
@@ -116,6 +121,16 @@ peripherals = [
 
 [device.adc]
 support_status = "partial"
+controller = "digital"
+channel_count = 4
+pcr_clock = true
+pcr_sar_clk_div = true
+line_calibration = true
+curve_calibration = true
+basic_calibration = true
+calibration_v1_scheme_supported = true
+channel_compensation = true
+sar_power_override = true
 instances = [
     { name = "adc1" },
 ]
@@ -125,12 +140,14 @@ support_status = "partial"
 status_registers = 3
 software_interrupt_count = 4
 controller = { Riscv = { flavour = "clic", interrupts = 32, priority_levels = 8 } }
+context_switch_source = "clint"
 
 [device.timergroup]
 support_status = "partial"
 instances = [{ name = "timg0" }, { name = "timg1" }]
 timg_has_divcnt_rst = true
 rc_fast_calibration = { divider = 32, min_rev = 0 }
+wdt_has_conf_update = true
 
 [device.gpio]
 support_status = "supported"
@@ -181,8 +198,8 @@ working_modes = [
     { id = 11, mode = "modular_division" }
 ]
 curves = [
-    { id = 0, curve = 192 },
-    { id = 1, curve = 256 }
+    { id = 0, curve = "p192" },
+    { id = 1, curve = "p256" }
 ]
 separate_jacobian_point_memory = true
 has_memory_clock_gate = true
@@ -222,9 +239,14 @@ wakeup_sources = {
     LpCore = 11,
 }
 
+[device.sleep.retention]
+cpu_retention = "software"
+cpu_retention_frame = "clic"
+supports_top_power_down = true
+
 [device.rng]
 support_status = { status = "partial", issue = 5981 }
-trng_supported = false  # TODO
+trng_supported = true
 apb_cycle_wait_num = 16 # TODO
 is_lp_sys = true
 
@@ -315,7 +337,6 @@ support_status = { status = "not_supported", issue = 5423 }
 
 [device.i2s]
 version = 3
-default_clock_source = 2
 mclk_divider_bit_width = 9
 max_ws_width = 512
 clock_configured_by_pcr = true
@@ -348,6 +369,8 @@ support_status = "partial"
 has_wifi6 = true
 mac_version = 3
 csi_supported = true
+has_nan = true
+has_ftm = true
 
 [device.bt]
 support_status = "partial"

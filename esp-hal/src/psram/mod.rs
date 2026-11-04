@@ -43,6 +43,9 @@
 
 use core::ops::Range;
 
+#[cfg(any(esp32s2, esp32s3))]
+mod quad_xtensa;
+
 #[cfg_attr(esp32, path = "esp32.rs")]
 #[cfg_attr(esp32s2, path = "esp32s2.rs")]
 #[cfg_attr(esp32s3, path = "esp32s3.rs")]
@@ -56,9 +59,9 @@ use portable_atomic::{AtomicUsize, Ordering};
 
 use crate::peripherals::PSRAM;
 
-/// Size of PSRAM
+/// Size of PSRAM.
 ///
-/// [PsramSize::AutoDetect] will try to detect the size of PSRAM
+/// [`PsramSize::AutoDetect`] tries to detect the size of PSRAM.
 #[derive(Copy, Clone, Debug, Default, PartialEq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[instability::unstable]
@@ -66,7 +69,7 @@ pub enum PsramSize {
     /// Detect PSRAM size
     #[default]
     AutoDetect,
-    /// A fixed PSRAM size
+    /// A fixed PSRAM size.
     Size(usize),
 }
 
@@ -96,7 +99,7 @@ pub(crate) fn psram_range() -> Range<usize> {
 
 /// # Safety
 ///
-/// This function must only be called once.
+/// Must only be called once.
 unsafe fn set_psram_range(range: Range<usize>) {
     MAPPED_PSRAM_START.store(range.start, Ordering::Relaxed);
     MAPPED_PSRAM_END.store(range.end, Ordering::Release);

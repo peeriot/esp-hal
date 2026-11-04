@@ -10,8 +10,6 @@ use hil_test as _;
 
 #[embedded_test::tests(default_timeout = 3)]
 mod tests {
-    #[cfg(esp32c6)]
-    use esp_hal::parl_io::{RxEightBits, TxEightBits};
     use esp_hal::{
         dma_rx_buffer,
         dma_tx_buffer,
@@ -23,12 +21,15 @@ mod tests {
             ParlIo,
             RxClkInPin,
             RxConfig,
+            RxEightBits,
             RxFourBits,
             RxOneBit,
+            RxPinConfigIncludingValidPin,
             RxPinConfigWithValidPin,
             RxTwoBits,
             SampleEdge,
             TxConfig,
+            TxEightBits,
             TxFourBits,
             TxOneBit,
             TxPinConfigWithValidPin,
@@ -38,6 +39,21 @@ mod tests {
         time::Rate,
     };
 
+    cfg_select! {
+        esp32c5 => {
+            use esp_hal::gpio::NoPin;
+        }
+        esp32c6 => {
+            use esp_hal::{
+                gpio::NoPin,
+                parl_io::{RxSixteenBits, TxPinConfigIncludingValidPin, TxSixteenBits},
+            };
+        }
+        esp32h2 => {
+            use esp_hal::parl_io::TxPinConfigIncludingValidPin;
+        }
+    }
+
     struct Context {
         parl_io: PARL_IO<'static>,
         dma_channel: DMA_CH0<'static>,
@@ -46,13 +62,7 @@ mod tests {
         data_pins: [AnyPin<'static>; 8],
     }
 
-    const MAX_CLK_RATE: Rate = Rate::from_mhz(if cfg!(esp32c5) {
-        // FIXME: Tests become flakey at higher speeds, no matter the sampling edge.
-        // Maybe an effect of the GPIO matrix injecting delay to the valid signal?
-        10
-    } else {
-        40
-    });
+    const MAX_CLK_RATE: Rate = Rate::from_mhz(40);
 
     #[init]
     fn init() -> Context {
@@ -64,15 +74,15 @@ mod tests {
 
         let (valid_pin, clock_pin, data_pins) = cfg_select! {
             esp32c5 => {
-                // 27 is RGB, 9 and 10 are connected, 13 and 14 is USB
+                // 27 is RGB, 13 and 14 is USB, 4 is tied to 5, 9 is tied to 10 (only 9 is driven)
                 (
                     peripherals.GPIO0.degrade(),
                     peripherals.GPIO1.degrade(),
                     [
                         peripherals.GPIO2.degrade(),
                         peripherals.GPIO3.degrade(),
-                        peripherals.GPIO4.degrade(),
-                        peripherals.GPIO5.degrade(),
+                        peripherals.GPIO23.degrade(),
+                        peripherals.GPIO24.degrade(),
                         peripherals.GPIO6.degrade(),
                         peripherals.GPIO7.degrade(),
                         peripherals.GPIO8.degrade(),
@@ -81,7 +91,7 @@ mod tests {
                 )
             }
             esp32c6 => {
-                // 8 is RGB, 2 and 3 are connected, 12 and 13 is USB
+                // 8 is RGB, 12 and 13 is USB, 2 is tied to 3 (only 2 is driven)
                 (
                     peripherals.GPIO0.degrade(),
                     peripherals.GPIO1.degrade(),
@@ -98,7 +108,8 @@ mod tests {
                 )
             }
             esp32h2 => {
-                // 8 is RGB, 2 and 3 are connected, 26 and 27 is USB
+                // 8 is RGB, 26 and 27 is USB, 12 and 22 are I2C, 2 is tied to 3, 10 is tied to 11.
+                // 23 is UART0 RX. The 8-bit test does not drive the last pin.
                 (
                     peripherals.GPIO0.degrade(),
                     peripherals.GPIO1.degrade(),
@@ -108,8 +119,8 @@ mod tests {
                         peripherals.GPIO5.degrade(),
                         peripherals.GPIO8.degrade(),
                         peripherals.GPIO9.degrade(),
-                        peripherals.GPIO10.degrade(),
-                        peripherals.GPIO11.degrade(),
+                        peripherals.GPIO13.degrade(),
+                        peripherals.GPIO25.degrade(),
                         peripherals.GPIO23.degrade(),
                     ],
                 )
@@ -143,7 +154,9 @@ mod tests {
         let rx_pins = RxPinConfigWithValidPin::new(rx_pins, valid_rx, EnableMode::HighLevel);
 
         let clock_out_pin = ClkOutPin::new(clock_tx);
-        let clock_in_pin = RxClkInPin::new(clock_rx, SampleEdge::Normal);
+        // Sample on the opposite edge of TX. Loopback through the GPIO matrix delays
+        // clock and data and same-edge sampling can violate hold time.
+        let clock_in_pin = RxClkInPin::new(clock_rx, SampleEdge::Invert);
 
         let pio = ParlIo::new(ctx.parl_io, ctx.dma_channel).unwrap();
 
@@ -205,7 +218,7 @@ mod tests {
         let rx_pins = RxPinConfigWithValidPin::new(rx_pins, valid_rx, EnableMode::HighLevel);
 
         let clock_out_pin = ClkOutPin::new(clock_tx);
-        let clock_in_pin = RxClkInPin::new(clock_rx, SampleEdge::Normal);
+        let clock_in_pin = RxClkInPin::new(clock_rx, SampleEdge::Invert);
 
         let pio = ParlIo::new(ctx.parl_io, ctx.dma_channel).unwrap();
 
@@ -273,7 +286,7 @@ mod tests {
         let rx_pins = RxPinConfigWithValidPin::new(rx_pins, valid_rx, EnableMode::HighLevel);
 
         let clock_out_pin = ClkOutPin::new(clock_tx);
-        let clock_in_pin = RxClkInPin::new(clock_rx, SampleEdge::Normal);
+        let clock_in_pin = RxClkInPin::new(clock_rx, SampleEdge::Invert);
 
         let pio = ParlIo::new(ctx.parl_io, ctx.dma_channel).unwrap();
 
@@ -317,10 +330,7 @@ mod tests {
         assert_eq!(dma_rx_buf.as_slice(), dma_tx_buf.as_slice());
     }
 
-    // This test is disabled on the H2 because in 8-bit mode, there's no external
-    // enable pin to indicate when data is valid. The C6 has the same issue in
-    // 16-bit mode. The test would have to be written differently for it to work
-    // reliably. See https://github.com/esp-rs/esp-hal/pull/3339.
+    // On 8-line chips, `RxEightBits` uses data line 7 for the valid signal.
     #[cfg(esp32c6)]
     #[test]
     fn test_parl_io_rx_can_read_tx_in_8_bit_mode(ctx: Context) {
@@ -349,7 +359,7 @@ mod tests {
         let rx_pins = RxPinConfigWithValidPin::new(rx_pins, valid_rx, EnableMode::HighLevel);
 
         let clock_out_pin = ClkOutPin::new(clock_tx);
-        let clock_in_pin = RxClkInPin::new(clock_rx, SampleEdge::Normal);
+        let clock_in_pin = RxClkInPin::new(clock_rx, SampleEdge::Invert);
 
         let pio = ParlIo::new(ctx.parl_io, ctx.dma_channel).unwrap();
 
@@ -392,17 +402,179 @@ mod tests {
 
         assert_eq!(dma_rx_buf.as_slice(), dma_tx_buf.as_slice());
     }
+
+    #[cfg(any(esp32c5, esp32h2))]
+    #[test]
+    fn test_parl_io_rx_can_read_tx_in_8_bit_mode_with_included_valid_pin(ctx: Context) {
+        const BUFFER_SIZE: usize = 64;
+
+        let mut dma_rx_buf = dma_rx_buffer!(BUFFER_SIZE).unwrap();
+        let mut dma_tx_buf = dma_tx_buffer!(BUFFER_SIZE).unwrap();
+
+        let (clock_rx, clock_tx) = unsafe { ctx.clock_pin.split() };
+        let (valid_rx, valid_tx) = unsafe { ctx.valid_pin.split() };
+        let [
+            (d0_rx, d0_tx),
+            (d1_rx, d1_tx),
+            (d2_rx, d2_tx),
+            (d3_rx, d3_tx),
+            (d4_rx, d4_tx),
+            (d5_rx, d5_tx),
+            (d6_rx, d6_tx),
+            _,
+        ] = ctx.data_pins.map(|pin| unsafe { pin.split() });
+
+        let tx_pins = cfg_select! {
+            esp32c5 => TxPinConfigWithValidPin::new(
+                TxEightBits::new(d0_tx, d1_tx, d2_tx, d3_tx, d4_tx, d5_tx, d6_tx, NoPin),
+                valid_tx,
+            ),
+            _ => TxPinConfigIncludingValidPin::new(TxEightBits::new(
+                d0_tx, d1_tx, d2_tx, d3_tx, d4_tx, d5_tx, d6_tx, valid_tx,
+            )),
+        };
+        let rx_pins = RxEightBits::new(d0_rx, d1_rx, d2_rx, d3_rx, d4_rx, d5_rx, d6_rx, valid_rx);
+        let rx_pins = RxPinConfigIncludingValidPin::new(rx_pins, EnableMode::HighLevel);
+
+        let clock_out_pin = ClkOutPin::new(clock_tx);
+        let clock_in_pin = RxClkInPin::new(clock_rx, SampleEdge::Invert);
+
+        let pio = ParlIo::new(ctx.parl_io, ctx.dma_channel).unwrap();
+
+        let pio_tx = pio
+            .tx
+            .with_config(
+                tx_pins,
+                clock_out_pin,
+                TxConfig::default()
+                    .with_frequency(MAX_CLK_RATE)
+                    .with_sample_edge(SampleEdge::Normal)
+                    .with_bit_order(BitPackOrder::Lsb),
+            )
+            .unwrap();
+        let pio_rx = pio
+            .rx
+            .with_config(
+                rx_pins,
+                clock_in_pin,
+                RxConfig::default()
+                    .with_frequency(MAX_CLK_RATE)
+                    .with_bit_order(BitPackOrder::Lsb),
+            )
+            .unwrap();
+
+        for (i, b) in dma_tx_buf.as_mut_slice().iter_mut().enumerate() {
+            *b = i as u8;
+        }
+
+        let rx_transfer = pio_rx
+            .read(Some(dma_rx_buf.len()), dma_rx_buf)
+            .map_err(|e| e.0)
+            .unwrap();
+        let tx_transfer = pio_tx
+            .write(dma_tx_buf.len(), dma_tx_buf)
+            .map_err(|e| e.0)
+            .unwrap();
+        (_, _, dma_tx_buf) = tx_transfer.wait();
+        (_, _, dma_rx_buf) = rx_transfer.wait();
+
+        // Data line 7 carries the valid signal. RX reads the valid level as data bit 7.
+        for (rx, tx) in dma_rx_buf.as_slice().iter().zip(dma_tx_buf.as_slice()) {
+            assert_eq!(*rx, tx & 0x7F | 0x80);
+        }
+    }
+
+    #[cfg(esp32c6)]
+    #[test]
+    fn test_parl_io_rx_can_read_tx_in_16_bit_mode_with_included_valid_pin(ctx: Context) {
+        const BUFFER_SIZE: usize = 128;
+
+        let mut dma_rx_buf = dma_rx_buffer!(BUFFER_SIZE).unwrap();
+        let mut dma_tx_buf = dma_tx_buffer!(BUFFER_SIZE).unwrap();
+
+        let (clock_rx, clock_tx) = unsafe { ctx.clock_pin.split() };
+        let (valid_rx, valid_tx) = unsafe { ctx.valid_pin.split() };
+        let [
+            (d0_rx, d0_tx),
+            (d1_rx, d1_tx),
+            (d2_rx, d2_tx),
+            (d3_rx, d3_tx),
+            (d4_rx, d4_tx),
+            (d5_rx, d5_tx),
+            (d6_rx, d6_tx),
+            (d7_rx, d7_tx),
+        ] = ctx.data_pins.map(|pin| unsafe { pin.split() });
+
+        let tx_pins = TxSixteenBits::new(
+            d0_tx, d1_tx, d2_tx, d3_tx, d4_tx, d5_tx, d6_tx, d7_tx, NoPin, NoPin, NoPin, NoPin,
+            NoPin, NoPin, NoPin, valid_tx,
+        );
+        let rx_pins = RxSixteenBits::new(
+            d0_rx, d1_rx, d2_rx, d3_rx, d4_rx, d5_rx, d6_rx, d7_rx, NoPin, NoPin, NoPin, NoPin,
+            NoPin, NoPin, NoPin, valid_rx,
+        );
+
+        let tx_pins = TxPinConfigIncludingValidPin::new(tx_pins);
+        let rx_pins = RxPinConfigIncludingValidPin::new(rx_pins, EnableMode::HighLevel);
+
+        let clock_out_pin = ClkOutPin::new(clock_tx);
+        let clock_in_pin = RxClkInPin::new(clock_rx, SampleEdge::Invert);
+
+        let pio = ParlIo::new(ctx.parl_io, ctx.dma_channel).unwrap();
+
+        // RX times out with 16 lines at `MAX_CLK_RATE`.
+        // With `BitPackOrder::Lsb`, RX swaps each pair of 16-bit samples.
+        let pio_tx = pio
+            .tx
+            .with_config(
+                tx_pins,
+                clock_out_pin,
+                TxConfig::default()
+                    .with_frequency(MAX_CLK_RATE / 2)
+                    .with_sample_edge(SampleEdge::Normal)
+                    .with_bit_order(BitPackOrder::Msb),
+            )
+            .unwrap();
+        let pio_rx = pio
+            .rx
+            .with_config(
+                rx_pins,
+                clock_in_pin,
+                RxConfig::default()
+                    .with_frequency(MAX_CLK_RATE / 2)
+                    .with_bit_order(BitPackOrder::Msb),
+            )
+            .unwrap();
+
+        for (i, b) in dma_tx_buf.as_mut_slice().iter_mut().enumerate() {
+            *b = i as u8;
+        }
+
+        let rx_transfer = pio_rx
+            .read(Some(dma_rx_buf.len()), dma_rx_buf)
+            .map_err(|e| e.0)
+            .unwrap();
+        let tx_transfer = pio_tx
+            .write(dma_tx_buf.len(), dma_tx_buf)
+            .map_err(|e| e.0)
+            .unwrap();
+        (_, _, dma_tx_buf) = tx_transfer.wait();
+        (_, _, dma_rx_buf) = rx_transfer.wait();
+
+        // Data lines 8 to 14 read low. Data line 15 carries the valid signal.
+        // RX reads the valid level as data bit 15.
+        let rx = dma_rx_buf.as_slice().chunks_exact(2);
+        let tx = dma_tx_buf.as_slice().chunks_exact(2);
+        for (rx, tx) in rx.zip(tx) {
+            assert_eq!(rx[0], tx[0]);
+            assert_eq!(rx[1], 0x80);
+        }
+    }
 }
 
 #[embedded_test::tests(default_timeout = 3)]
 mod tx {
     use defmt::info;
-    #[cfg(any(esp32c6, esp32h2))]
-    use esp_hal::parl_io::TxPinConfigIncludingValidPin;
-    #[cfg(any(esp32c5, esp32c6))]
-    use esp_hal::parl_io::TxPinConfigWithValidPin;
-    #[cfg(esp32c6)]
-    use esp_hal::parl_io::TxSixteenBits;
     use esp_hal::{
         dma::DmaTxBuf,
         dma_tx_buffer,
@@ -412,13 +584,28 @@ mod tx {
         },
         parl_io::{BitPackOrder, ClkOutPin, ParlIo, SampleEdge, TxConfig, TxEightBits},
         pcnt::{
-            Pcnt,
             channel::{CtrlMode, EdgeMode},
             unit::Unit,
         },
         peripherals::{DMA_CH0, PARL_IO},
         time::Rate,
     };
+
+    cfg_select! {
+        esp32c5 => {
+            use esp_hal::parl_io::TxPinConfigWithValidPin;
+        }
+        esp32c6 => {
+            use esp_hal::parl_io::{
+                TxPinConfigIncludingValidPin,
+                TxPinConfigWithValidPin,
+                TxSixteenBits,
+            };
+        }
+        esp32h2 => {
+            use esp_hal::parl_io::TxPinConfigIncludingValidPin;
+        }
+    }
 
     struct Context {
         parl_io: PARL_IO<'static>,
@@ -427,7 +614,7 @@ mod tx {
         valid: OutputSignal<'static>,
         clock_loopback: InputSignal<'static>,
         valid_loopback: InputSignal<'static>,
-        pcnt_unit: Unit<'static, 0>,
+        pcnt_unit: Unit<'static>,
     }
     #[init]
     fn init() -> Context {
@@ -437,8 +624,7 @@ mod tx {
         let valid = hil_test::unconnected_pin!(peripherals);
         let (clock_loopback, clock) = unsafe { clock.split() };
         let (valid_loopback, valid) = unsafe { valid.split() };
-        let pcnt = Pcnt::new(peripherals.PCNT);
-        let pcnt_unit = pcnt.unit0;
+        let pcnt_unit = Unit::new(peripherals.PCNT0_UNIT0);
         let dma_channel = peripherals.DMA_CH0;
 
         let parl_io = peripherals.PARL_IO;
@@ -506,28 +692,71 @@ mod tx {
     }
 
     #[test]
+    fn test_parl_io_tx_clock_frequency(ctx: Context) {
+        use esp_hal::{
+            parl_io::{TxOneBit, TxPinConfigWithValidPin},
+            time::{Duration, Instant},
+        };
+
+        // 64000 clock cycles, 4 ms at 16 MHz.
+        let dma_tx_buf: DmaTxBuf = dma_tx_buffer!(8000).unwrap();
+        let pins = TxPinConfigWithValidPin::new(TxOneBit::new(NoPin), ctx.valid);
+
+        let pio = ParlIo::new(ctx.parl_io, ctx.dma_channel).unwrap();
+
+        // 16 MHz divides the PARL_IO source clock of all chips.
+        let pio = pio
+            .tx
+            .with_config(
+                pins,
+                ClkOutPin::new(ctx.clock),
+                TxConfig::default().with_frequency(Rate::from_mhz(16)),
+            )
+            .unwrap();
+
+        let clock_unit = ctx.pcnt_unit;
+        clock_unit.channel0.set_edge_signal(ctx.clock_loopback);
+        clock_unit
+            .channel0
+            .set_input_mode(EdgeMode::Increment, EdgeMode::Hold);
+        clock_unit
+            .channel0
+            .set_ctrl_mode(CtrlMode::Keep, CtrlMode::Keep);
+
+        let xfer = pio
+            .write(dma_tx_buf.len(), dma_tx_buf)
+            .map_err(|e| e.0)
+            .unwrap();
+
+        // Count the clock edges in a window after the start of the transfer.
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_micros(200) {}
+        clock_unit.clear();
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_micros(1000) {}
+        let edges = clock_unit.value() as u64;
+        let elapsed = start.elapsed().as_micros();
+        _ = xfer.wait();
+
+        let khz = edges * 1000 / elapsed;
+        info!("clock frequency: {} kHz", khz);
+        assert!((15840..=16160).contains(&khz), "clock is {} kHz", khz);
+    }
+
+    #[test]
     fn test_parl_io_tx_8bit_valid_clock_count(ctx: Context) {
         const BUFFER_SIZE: usize = 64;
         let mut dma_tx_buf: DmaTxBuf = dma_tx_buffer!(BUFFER_SIZE).unwrap();
 
-        let pins = TxEightBits::new(
-            NoPin,
-            NoPin,
-            NoPin,
-            NoPin,
-            NoPin,
-            NoPin,
-            NoPin,
-            #[cfg(esp32h2)]
-            ctx.valid,
-            #[cfg(any(esp32c5, esp32c6))]
-            NoPin,
-        );
-
-        #[cfg(esp32h2)]
-        let pins = TxPinConfigIncludingValidPin::new(pins);
-        #[cfg(any(esp32c5, esp32c6))]
-        let pins = TxPinConfigWithValidPin::new(pins, ctx.valid);
+        let pins = cfg_select! {
+            esp32h2 => TxPinConfigIncludingValidPin::new(TxEightBits::new(
+                NoPin, NoPin, NoPin, NoPin, NoPin, NoPin, NoPin, ctx.valid,
+            )),
+            _ => TxPinConfigWithValidPin::new(
+                TxEightBits::new(NoPin, NoPin, NoPin, NoPin, NoPin, NoPin, NoPin, NoPin),
+                ctx.valid,
+            ),
+        };
 
         let clock_pin = ClkOutPin::new(ctx.clock);
 
@@ -571,12 +800,6 @@ mod tx {
 #[embedded_test::tests(default_timeout = 3, executor = hil_test::Executor::new())]
 mod async_tx {
     use defmt::info;
-    #[cfg(any(esp32c6, esp32h2))]
-    use esp_hal::parl_io::TxPinConfigIncludingValidPin;
-    #[cfg(any(esp32c5, esp32c6))]
-    use esp_hal::parl_io::TxPinConfigWithValidPin;
-    #[cfg(esp32c6)]
-    use esp_hal::parl_io::TxSixteenBits;
     use esp_hal::{
         dma::DmaTxBuf,
         dma_tx_buffer,
@@ -586,13 +809,28 @@ mod async_tx {
         },
         parl_io::{BitPackOrder, ClkOutPin, ParlIo, SampleEdge, TxConfig, TxEightBits},
         pcnt::{
-            Pcnt,
             channel::{CtrlMode, EdgeMode},
             unit::Unit,
         },
         peripherals::{DMA_CH0, PARL_IO},
         time::Rate,
     };
+
+    cfg_select! {
+        esp32c5 => {
+            use esp_hal::parl_io::TxPinConfigWithValidPin;
+        }
+        esp32c6 => {
+            use esp_hal::parl_io::{
+                TxPinConfigIncludingValidPin,
+                TxPinConfigWithValidPin,
+                TxSixteenBits,
+            };
+        }
+        esp32h2 => {
+            use esp_hal::parl_io::TxPinConfigIncludingValidPin;
+        }
+    }
 
     struct Context {
         parl_io: PARL_IO<'static>,
@@ -601,7 +839,7 @@ mod async_tx {
         valid: OutputSignal<'static>,
         clock_loopback: InputSignal<'static>,
         valid_loopback: InputSignal<'static>,
-        pcnt_unit: Unit<'static, 0>,
+        pcnt_unit: Unit<'static>,
     }
     #[init]
     async fn init() -> Context {
@@ -611,8 +849,7 @@ mod async_tx {
         let valid = hil_test::unconnected_pin!(peripherals);
         let (clock_loopback, clock) = unsafe { clock.split() };
         let (valid_loopback, valid) = unsafe { valid.split() };
-        let pcnt = Pcnt::new(peripherals.PCNT);
-        let pcnt_unit = pcnt.unit0;
+        let pcnt_unit = Unit::new(peripherals.PCNT0_UNIT0);
         let dma_channel = peripherals.DMA_CH0;
 
         let parl_io = peripherals.PARL_IO;
@@ -657,7 +894,7 @@ mod async_tx {
             )
             .unwrap();
 
-        // use a PCNT unit to count the negitive clock edges only when valid is high
+        // use a PCNT unit to count the negative clock edges only when valid is high
         let clock_unit = ctx.pcnt_unit;
         clock_unit.channel0.set_edge_signal(ctx.clock_loopback);
         clock_unit.channel0.set_ctrl_signal(ctx.valid_loopback);
@@ -687,24 +924,15 @@ mod async_tx {
 
         let mut dma_tx_buf: DmaTxBuf = dma_tx_buffer!(BUFFER_SIZE).unwrap();
 
-        let pins = TxEightBits::new(
-            NoPin,
-            NoPin,
-            NoPin,
-            NoPin,
-            NoPin,
-            NoPin,
-            NoPin,
-            #[cfg(esp32h2)]
-            ctx.valid,
-            #[cfg(any(esp32c5, esp32c6))]
-            NoPin,
-        );
-
-        #[cfg(esp32h2)]
-        let pins = TxPinConfigIncludingValidPin::new(pins);
-        #[cfg(any(esp32c5, esp32c6))]
-        let pins = TxPinConfigWithValidPin::new(pins, ctx.valid);
+        let pins = cfg_select! {
+            esp32h2 => TxPinConfigIncludingValidPin::new(TxEightBits::new(
+                NoPin, NoPin, NoPin, NoPin, NoPin, NoPin, NoPin, ctx.valid,
+            )),
+            _ => TxPinConfigWithValidPin::new(
+                TxEightBits::new(NoPin, NoPin, NoPin, NoPin, NoPin, NoPin, NoPin, NoPin),
+                ctx.valid,
+            ),
+        };
 
         let clock_pin = ClkOutPin::new(ctx.clock);
 
@@ -724,7 +952,7 @@ mod async_tx {
             )
             .unwrap();
 
-        // use a PCNT unit to count the negitive clock edges only when
+        // use a PCNT unit to count the negative clock edges only when
         // valid is high
         let clock_unit = ctx.pcnt_unit;
         clock_unit.channel0.set_edge_signal(ctx.clock_loopback);

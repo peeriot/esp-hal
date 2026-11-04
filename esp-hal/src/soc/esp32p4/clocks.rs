@@ -35,15 +35,15 @@ define_clock_tree_types!();
 #[non_exhaustive]
 pub enum CpuClock {
     /// 400 MHz CPU clock (eco5 / v3.x maximum)
-    /// CPLL -> CPU_ROOT -> CPU/1, APB divider /4 = 100MHz
+    /// CPLL -> CPU_ROOT -> CPU/1, APB divider /4 = 100 MHz
     _400MHz = 400,
 
     /// 200 MHz CPU clock (low power)
-    /// CPLL -> CPU_ROOT -> CPU/2, APB /2 = 100MHz
+    /// CPLL -> CPU_ROOT -> CPU/2, APB /2 = 100 MHz
     _200MHz = 200,
 
     /// 100 MHz CPU clock (ultra low power)
-    /// CPLL -> CPU_ROOT -> CPU/4, APB /1 = 100MHz
+    /// CPLL -> CPU_ROOT -> CPU/4, APB /1 = 100 MHz
     #[default]
     _100MHz = 100,
 }
@@ -58,6 +58,7 @@ impl CpuClock {
         mem_clk: Some(MemClkConfig::new(1)), // /2 = 200 MHz
         sys_clk: Some(SysClkConfig::new(0)), // /1 = 200 MHz
         apb_clk: Some(ApbClkConfig::new(1)), // /2 = 100 MHz
+        crypto_clk: Some(CryptoClkConfig::PllF240m),
         iomux_function_clock: Some(IomuxFunctionClockConfig::new(
             IomuxFunctionClockSource::PllF80m,
             0,
@@ -77,6 +78,7 @@ impl CpuClock {
         mem_clk: Some(MemClkConfig::new(0)), // /1 = 200 MHz
         sys_clk: Some(SysClkConfig::new(0)), // /1 = 200 MHz
         apb_clk: Some(ApbClkConfig::new(1)), // /2 = 100 MHz
+        crypto_clk: Some(CryptoClkConfig::PllF240m),
         iomux_function_clock: Some(IomuxFunctionClockConfig::new(
             IomuxFunctionClockSource::PllF80m,
             0,
@@ -94,6 +96,7 @@ impl CpuClock {
         mem_clk: Some(MemClkConfig::new(0)), // /1 = 100 MHz
         sys_clk: Some(SysClkConfig::new(0)), // /1 = 100 MHz
         apb_clk: Some(ApbClkConfig::new(0)), // /1 = 100 MHz
+        crypto_clk: Some(CryptoClkConfig::PllF240m),
         iomux_function_clock: Some(IomuxFunctionClockConfig::new(
             IomuxFunctionClockSource::PllF80m,
             0,
@@ -434,6 +437,7 @@ fn configure_lp_slow_clk_impl(
         .modify(|_, w| unsafe {
             w.lp_aonclkrst_slow_clk_sel().bits(match new_selector {
                 LpSlowClkConfig::RcSlow => 0,
+                #[cfg(use_xtal32k)]
                 LpSlowClkConfig::Xtal32k => 1,
                 // LpSlowClkConfig::Rc32k => 2,
                 LpSlowClkConfig::OscSlow => 3,
@@ -516,6 +520,7 @@ fn enable_lp_slow_clk_impl(_clocks: &mut ClockTree, _en: bool) {}
 
 // Source clock enable/disable stubs (PLLs, oscillators)
 fn enable_rc_fast_clk_impl(_clocks: &mut ClockTree, _en: bool) {}
+#[cfg(use_xtal32k)]
 fn enable_xtal32k_clk_impl(_clocks: &mut ClockTree, _en: bool) {}
 fn enable_osc_slow_clk_impl(_clocks: &mut ClockTree, _en: bool) {}
 fn enable_rc_slow_clk_impl(_clocks: &mut ClockTree, _en: bool) {}
@@ -528,6 +533,30 @@ fn enable_pll_f240m_impl(_clocks: &mut ClockTree, _en: bool) {}
 fn enable_pll_f25m_impl(_clocks: &mut ClockTree, _en: bool) {}
 fn enable_pll_f50m_impl(_clocks: &mut ClockTree, _en: bool) {}
 fn enable_xtal_d2_clk_impl(_clocks: &mut ClockTree, _en: bool) {}
+fn enable_spll_d3_clock_impl(_clocks: &mut ClockTree, _en: bool) {}
+
+// CRYPTO_CLK
+
+fn enable_crypto_clk_impl(_clocks: &mut ClockTree, _en: bool) {
+    // Nothing to do here.
+}
+
+fn configure_crypto_clk_impl(
+    _clocks: &mut ClockTree,
+    _old_config: Option<CryptoClkConfig>,
+    new_config: CryptoClkConfig,
+) {
+    HP_SYS_CLKRST::regs()
+        .peri_clk_ctrl25()
+        .modify(|_, w| unsafe {
+            w.crypto_clk_src_sel().bits(match new_config {
+                CryptoClkConfig::Xtal => 0,
+                CryptoClkConfig::RcFast => 1,
+                CryptoClkConfig::PllF240m => 2,
+                CryptoClkConfig::PllF160m => 3,
+            })
+        });
+}
 
 // TIMG_CALIBRATION_CLOCK
 
@@ -638,6 +667,7 @@ fn configure_timg_calibration_clock_impl(
                 TimgCalibrationClockConfig::CpllClk => 2,
                 TimgCalibrationClockConfig::RcFastDivClk => 7,
                 TimgCalibrationClockConfig::RcSlowClk => 8,
+                #[cfg(use_xtal32k)]
                 TimgCalibrationClockConfig::Xtal32kClk => 10,
             })
         });

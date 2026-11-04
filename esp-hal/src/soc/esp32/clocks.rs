@@ -17,10 +17,12 @@
 
 use esp_rom_sys::rom::{ets_delay_us, ets_update_cpu_frequency_rom};
 
+#[cfg(use_xtal32k)]
+use crate::peripherals::RTC_IO;
 use crate::{
     clock::RtcClock,
     efuse::VOL_LEVEL_HP_INV,
-    peripherals::{APB_CTRL, LPWR, RMT, RTC_IO, SYSTEM, TIMG0},
+    peripherals::{APB_CTRL, LPWR, RMT, SYSTEM, TIMG0},
     rtc_cntl::Rtc,
     soc::{regi2c, xtal32k},
     time::Rate,
@@ -57,6 +59,7 @@ impl CpuClock {
         syscon_pre_div: None,
         cpu_clk: Some(CpuClkConfig::Pll),
         rtc_slow_clk: Some(xtal32k::default_rtc_slow_clk()),
+        ble_lp_clk: Some(BleLpClkConfig::Xtal),
         rtc_fast_clk: Some(RtcFastClkConfig::Rc),
         timg_calibration_clock: None,
     };
@@ -68,6 +71,7 @@ impl CpuClock {
         syscon_pre_div: None,
         cpu_clk: Some(CpuClkConfig::Pll),
         rtc_slow_clk: Some(xtal32k::default_rtc_slow_clk()),
+        ble_lp_clk: Some(BleLpClkConfig::Xtal),
         rtc_fast_clk: Some(RtcFastClkConfig::Rc),
         timg_calibration_clock: None,
     };
@@ -79,6 +83,7 @@ impl CpuClock {
         syscon_pre_div: None,
         cpu_clk: Some(CpuClkConfig::Pll),
         rtc_slow_clk: Some(xtal32k::default_rtc_slow_clk()),
+        ble_lp_clk: Some(BleLpClkConfig::Xtal),
         rtc_fast_clk: Some(RtcFastClkConfig::Rc),
         timg_calibration_clock: None,
     };
@@ -190,6 +195,16 @@ fn configure_xtal_clk_impl(
 }
 
 // PLL_CLK
+
+/// Configures and calibrates the BBPLL again.
+///
+/// The BBPLL loses its analog configuration while the RTC controller powers it down, for example in
+/// a light sleep. ESP-IDF configures it again before it uses the PLL after a wake.
+pub(crate) fn reconfigure_pll(clocks: &mut ClockTree) {
+    if clocks.pll_clk_refcount > 0 {
+        enable_pll_clk_impl(clocks, true);
+    }
+}
 
 fn enable_pll_clk_impl(clocks: &mut ClockTree, en: bool) {
     // TODO: this should probably be refcounted with APLL, but ESP32 TRM states APLL_CLK is sourced
@@ -361,6 +376,12 @@ fn enable_rc_fast_clk_impl(_clocks: &mut ClockTree, en: bool) {
 // PLL_F160M_CLK
 
 fn enable_pll_f160m_clk_impl(_clocks: &mut ClockTree, _en: bool) {
+    // Nothing to do.
+}
+
+// PLL_D2_CLK
+
+fn enable_pll_d2_clk_impl(_clocks: &mut ClockTree, _en: bool) {
     // Nothing to do.
 }
 
@@ -586,6 +607,7 @@ fn enable_apb_clk_80m_impl(_clocks: &mut ClockTree, _en: bool) {
 
 // XTAL32K_CLK
 
+#[cfg(use_xtal32k)]
 fn enable_xtal32k_clk_impl(_clocks: &mut ClockTree, en: bool) {
     // RTCIO could be configured to allow an external oscillator to be used. We could model this
     // with a MUX, probably, but this is omitted for now for simplicity.
@@ -664,6 +686,7 @@ fn configure_rtc_slow_clk_impl(
 ) {
     LPWR::regs().clk_conf().modify(|_, w| match new_config {
         RtcSlowClkConfig::RcSlow => w.ana_clk_rtc_sel().slow_ck(),
+        #[cfg(use_xtal32k)]
         RtcSlowClkConfig::Xtal32k => w.ana_clk_rtc_sel().ck_xtal_32k(),
         RtcSlowClkConfig::RcFast => w.ana_clk_rtc_sel().ck8m_d256_out(),
     });
@@ -721,6 +744,7 @@ fn configure_timg_calibration_clock_impl(
         w.rtc_cali_clk_sel().bits(match new_config {
             TimgCalibrationClockConfig::RcSlowClk => 0,
             TimgCalibrationClockConfig::RcFastDivClk => 1,
+            #[cfg(use_xtal32k)]
             TimgCalibrationClockConfig::Xtal32kClk => 2,
         })
     });
@@ -760,4 +784,24 @@ impl RmtInstance {
                 .modify(|_, w| w.ref_always_on().bit(new_config == RmtSclkConfig::ApbClk));
         }
     }
+}
+
+// BLE_LP_XTAL_CLK
+
+fn enable_ble_lp_xtal_clk_impl(_clocks: &mut ClockTree, _en: bool) {
+    // Nothing to do.
+}
+
+// BLE_LP_CLK
+
+fn enable_ble_lp_clk_impl(_clocks: &mut ClockTree, _en: bool) {
+    // Nothing to do.
+}
+
+fn configure_ble_lp_clk_impl(
+    _clocks: &mut ClockTree,
+    _old_config: Option<BleLpClkConfig>,
+    _new_config: BleLpClkConfig,
+) {
+    // The BTDM controller programs the source and divider.
 }

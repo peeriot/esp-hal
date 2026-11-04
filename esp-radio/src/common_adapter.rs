@@ -11,7 +11,10 @@ use crate::{
 };
 
 #[ram]
-#[cfg(any(feature = "coex", all(feature = "ble", bt_controller = "btdm")))]
+#[cfg(any(
+    feature = "coex",
+    all(feature = "ble", any(bt_controller = "btdm", bt_controller = "btdm2"))
+))]
 pub(crate) unsafe extern "C" fn is_in_isr() -> i32 {
     !hal::interrupt::RunLevel::current().is_thread() as i32
 }
@@ -346,7 +349,7 @@ pub(crate) fn enable_wifi_power_domain() {
             const BTBB_RST: u32 = 1 << 3; // Bluetooth Baseband
             const BTMAC_RST: u32 = 1 << 4; // deprecated
             const RW_BTMAC_RST: u32 = 1 << 9; // Bluetooth MAC
-            const RW_BTMAC_REG_RST: u32 = 1 << 11; // Bluetooth MAC Regsiters
+            const RW_BTMAC_REG_RST: u32 = 1 << 11; // Bluetooth MAC Registers
             const BTBB_REG_RST: u32 = 1 << 13; // Bluetooth Baseband Registers
 
             const MODEM_RESET_FIELD_WHEN_PU: u32 = WIFIBB_RST

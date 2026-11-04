@@ -1,5 +1,5 @@
 use std::{
-    fs::{self, create_dir_all},
+    fs::{self, FileTimes, create_dir_all},
     io::Write,
     path::{Path, PathBuf},
 };
@@ -91,10 +91,21 @@ pub fn build_documentation(
             // Some packages have chip features, but they have no effect on the public API;
             // in this case, there's no point building it multiple times, so just build one
             // copy of the docs. Otherwise, use the provided chip arguments:
-            match package {
-                _ if package.chip_features_matter() => chips.to_vec(),
-                Package::XtensaLxRt => vec![Chip::Esp32s3],
-                _ => vec![Chip::Esp32c6],
+            if package.chip_features_matter() {
+                chips.to_vec()
+            } else {
+                let chip = chips
+                    .iter()
+                    .copied()
+                    .find(|c| *c == Chip::Esp32c6 && package.validate_package_chip(c).is_ok())
+                    .or_else(|| {
+                        chips
+                            .iter()
+                            .copied()
+                            .find(|c| package.validate_package_chip(c).is_ok())
+                    })
+                    .unwrap_or(Chip::Esp32c6);
+                vec![chip]
             }
         } else {
             log::debug!("Package '{package}' does not have chip features, ignoring argument");
@@ -289,11 +300,26 @@ fn highest_eligible_version(manifest: &Manifest) -> Option<semver::Version> {
 }
 
 /// Relative URL from `latest/index.html` to this package's versioned docs root.
-fn latest_redirect_base(package: &Package, version: &semver::Version) -> String {
+///
+/// nginx rewrites `/latest/<rest>` deep links to `/latest/?path=<rest>`, and the
+/// redirect page merges that `path` onto this base, so the base must always be the
+/// version root: `<rest>` already starts with the chip directory for packages with
+/// device-specific docs, or with the crate directory otherwise.
+fn latest_redirect_base(version: &semver::Version) -> String {
+    format!("../{}/", version)
+}
+
+/// Path (relative to the versioned docs root) used when `/latest/` is requested
+/// without a deep-link remainder.
+///
+/// Packages with device-specific docs generate an index page at their version
+/// root, so no fallback path is needed. Other packages have no such index (the
+/// version root 404s/403s), so point at the crate's rustdoc index instead.
+fn latest_redirect_fallback(package: &Package) -> String {
     if package.chip_features_matter() {
-        format!("../{}/", version)
+        String::new()
     } else {
-        format!("../{}/{}/", version, package.to_string().replace('-', "_"))
+        format!("{}/index.html", package.to_string().replace('-', "_"))
     }
 }
 
@@ -303,12 +329,14 @@ fn latest_redirect_html(
     package: &Package,
     version: &semver::Version,
 ) -> Result<String> {
-    let base = latest_redirect_base(package, version);
+    let base = latest_redirect_base(version);
+    let fallback = latest_redirect_fallback(package);
     let resources_path = workspace.join("resources");
 
     render_template(&resources_path, "latest_redirect.html.somni", {
         let mut env = Env::new();
-        env.value("base", base.as_str());
+        env.value("base", base.as_str())
+            .value("fallback", fallback.as_str());
         env
     })
 }
@@ -320,8 +348,7 @@ fn cargo_doc(
     channel: Option<&str>,
     base_url: Option<&str>,
 ) -> Result<PathBuf> {
-    let package_name = package.to_string();
-    let package_path = crate::windows_safe_path(&workspace.join(&package_name));
+    let package_path = crate::windows_safe_path(&workspace.join(package.directory()));
 
     // Process Cargo.toml for documentation
     let pre_process_res = pre_process_cargo_toml(chip, &package_path);
@@ -331,11 +358,11 @@ fn cargo_doc(
             cargo_doc_without_pre_processing(workspace, package, chip, channel, base_url);
 
         // Restore the original Cargo.toml
-        restore_cargo_toml(package_path)?;
+        restore_cargo_toml(&package_path)?;
         cargo_doc_res
     } else {
         // Restore the original Cargo.toml
-        restore_cargo_toml(package_path)?;
+        restore_cargo_toml(&package_path)?;
         Err(pre_process_res.err().unwrap())
     }
 }
@@ -348,7 +375,7 @@ fn cargo_doc_without_pre_processing(
     base_url: Option<&str>,
 ) -> Result<PathBuf> {
     let package_name = package.to_string();
-    let package_path = crate::windows_safe_path(&workspace.join(&package_name));
+    let package_path = crate::windows_safe_path(&workspace.join(package.directory()));
 
     // build documentation using the pre-processed Cargo.toml
     if let Some(chip) = chip {
@@ -374,33 +401,63 @@ fn cargo_doc_without_pre_processing(
         None
     };
 
-    // cleaning the docs isn't strictly necessary but otherwise rustdoc will pick up
-    // any docs which were built previously resulting in inconsistency regarding how esp-*
-    // inter-crate links are rendered
-    //
-    // however a real problem is that this could pick up e.g. esp-hal docs for the wrong target chip
-    // (rustdoc doesn't know about our chip features, it just knows about target triples!)
-    //
-    // this was never an issue when building via the GitHub workflow because of the way the job is
-    // setup but better safe than sorry
-    //
-    // ideally we could just use `cargo clean --doc` but for `+esp` this turned out to be not
-    // working as intended
     let mut docs_target = if let Ok(target_path) = std::env::var("CARGO_TARGET_DIR") {
         PathBuf::from(target_path)
     } else {
-        workspace.join(package.to_string()).join("target")
+        workspace.join(package.directory()).join("target")
     };
     if let Some(ref target) = target {
         docs_target = docs_target.join(&target);
     };
     docs_target = docs_target.join("doc");
 
-    if docs_target.exists() {
-        log::info!("Removing directory {:?}", docs_target);
-        fs::remove_dir_all(&docs_target)
-            .with_context(|| format!("Unable to remove {:?}", docs_target))?;
+    // One rustdoc output directory is shared by every package and chip on the same target
+    // triple, and rustdoc does not know about our chip features. Park the previous build's
+    // directory under `.xtask-doc-cache/<id>` and restore the one for this package and chip
+    // if we have built it before, so Cargo can skip rustdoc when nothing changed.
+    let build_id_path = docs_target.with_file_name(".xtask-doc-build-id");
+    let cache_dir = docs_target.with_file_name(".xtask-doc-cache");
+    let build_id = match chip {
+        Some(chip) => format!("{package}-{chip}"),
+        None => package.to_string(),
+    };
+
+    let prev_id = fs::read_to_string(&build_id_path)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty() && !s.contains(['/', '\\', ' ']));
+
+    if docs_target.exists() && prev_id.as_deref() != Some(build_id.as_str()) {
+        if let Some(prev_id) = prev_id {
+            let parked = cache_dir.join(prev_id);
+            if parked.exists() {
+                fs::remove_dir_all(&parked)
+                    .with_context(|| format!("Unable to remove {:?}", parked))?;
+            }
+            fs::create_dir_all(&cache_dir)
+                .with_context(|| format!("Unable to create {:?}", cache_dir))?;
+            fs::rename(&docs_target, &parked)
+                .with_context(|| format!("Unable to park {:?} to {:?}", docs_target, parked))?;
+        } else {
+            log::info!("Removing directory {:?}", docs_target);
+            fs::remove_dir_all(&docs_target)
+                .with_context(|| format!("Unable to remove {:?}", docs_target))?;
+        }
     }
+
+    if !docs_target.exists() {
+        let parked = cache_dir.join(&build_id);
+        if parked.exists() {
+            fs::rename(&parked, &docs_target)
+                .with_context(|| format!("Unable to restore {:?} to {:?}", parked, docs_target))?;
+        }
+    }
+
+    if let Some(parent) = build_id_path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("Unable to create {:?}", parent))?;
+    }
+    fs::write(&build_id_path, &build_id)
+        .with_context(|| format!("Failed to write {}", build_id_path.display()))?;
 
     let mut features = vec![];
     let doc_config = if let Some(chip) = &chip {
@@ -492,34 +549,19 @@ fn cargo_doc_without_pre_processing(
         }
     }
     builder.add_env_var("RUSTDOCFLAGS", &rustdocflags);
-    // Special case: `esp-storage` requires the optimization level to be 2 or 3:
-    if package == Package::EspStorage {
-        builder.add_env_var("CARGO_PROFILE_DEBUG_OPT_LEVEL", "3");
-    }
 
     let command = CargoCommandBatcher::build_one_for_cargo(&builder);
     log::debug!("{command:#?}");
     crate::cargo::run_with_env(&command.command, &package_path, command.env_vars, false)
         .with_context(|| format!("Failed to run `cargo doc` for {}", package_name))?;
 
-    // Build up the path at which the built documentation can be found:
-    let mut docs_path = if let Ok(target_path) = std::env::var("CARGO_TARGET_DIR") {
-        PathBuf::from(target_path)
-    } else {
-        workspace.join(package.to_string()).join("target")
-    };
-
-    if let Some(ref target) = target {
-        docs_path = docs_path.join(target);
-    }
-    docs_path = docs_path.join("doc");
-
-    Ok(crate::windows_safe_path(&docs_path))
+    Ok(crate::windows_safe_path(&docs_target))
 }
 
 /// Pre-process the Cargo.toml file
 ///
-/// This will keep the original as "Cargo.toml_original"
+/// This will keep the original as "Cargo.toml_original", unless there is nothing to
+/// pre-process, in which case the file is left untouched.
 ///
 /// This will check for `#DOC_IF <condition>` lines - evaluating the condition to false will turn
 /// any documenting comments into non-documenting comments until a `#DOC_ENDIF` line is encountered.
@@ -527,26 +569,13 @@ fn cargo_doc_without_pre_processing(
 /// The only currently supported function for expressions is `has(<SYMBOL>)`
 /// e.g. `has("psram")`
 fn pre_process_cargo_toml(chip: Option<Chip>, package_path: &Path) -> Result<(), anyhow::Error> {
-    let cargo_toml = std::fs::read_to_string(windows_safe_path(&package_path.join("Cargo.toml")))
-        .with_context(|| {
-        format!(
-            "Failed to read {}",
-            package_path.join("Cargo.toml").display()
-        )
-    })?;
+    restore_cargo_toml(package_path)?;
 
-    std::fs::rename(
-        windows_safe_path(&package_path.join("Cargo.toml")),
-        windows_safe_path(&package_path.join("Cargo.toml_original")),
-    )
-    .with_context(|| {
-        format!(
-            "Failed to rename {}",
-            package_path.join("Cargo.toml").display()
-        )
-    })?;
+    let manifest_path = windows_safe_path(&package_path.join("Cargo.toml"));
+    let original_path = windows_safe_path(&package_path.join("Cargo.toml_original"));
 
-    let cargo_toml = cargo_toml.lines();
+    let cargo_toml = std::fs::read_to_string(&manifest_path)
+        .with_context(|| format!("Failed to read {}", manifest_path.display()))?;
 
     let chip_cfg = chip.as_ref().map(|chip| Config::for_chip(chip));
     let mut processed_cargo_toml = Vec::new();
@@ -560,7 +589,7 @@ fn pre_process_cargo_toml(chip: Option<Chip>, package_path: &Path) -> Result<(),
     });
 
     let mut hide = false;
-    for line in cargo_toml {
+    for line in cargo_toml.lines() {
         let mut line = line.to_string();
 
         if line.starts_with("#DOC_ENDIF") {
@@ -588,22 +617,35 @@ fn pre_process_cargo_toml(chip: Option<Chip>, package_path: &Path) -> Result<(),
         processed_cargo_toml.push(line);
     }
 
-    std::fs::write(
-        windows_safe_path(&package_path.join("Cargo.toml")),
-        processed_cargo_toml.join("\n"),
-    )
-    .with_context(|| {
-        format!(
-            "Failed to write pre-processed {}",
-            package_path.join("Cargo.toml").display()
-        )
-    })?;
+    let mut processed_cargo_toml = processed_cargo_toml.join("\n");
+    if cargo_toml.ends_with('\n') {
+        processed_cargo_toml.push('\n');
+    }
+
+    // Rewriting the manifest would make cargo rebuild the crate, so leave it alone when
+    // there is nothing to pre-process.
+    if processed_cargo_toml == cargo_toml {
+        return Ok(());
+    }
+
+    std::fs::rename(&manifest_path, &original_path)
+        .with_context(|| format!("Failed to rename {}", manifest_path.display()))?;
+
+    std::fs::write(&manifest_path, processed_cargo_toml)
+        .with_context(|| format!("Failed to write pre-processed {}", manifest_path.display()))?;
+
+    // Keep the original mtime so Cargo does not treat the temporary manifest as newly modified.
+    let mtime = fs::metadata(&original_path)?.modified()?;
+    fs::File::options()
+        .write(true)
+        .open(&manifest_path)?
+        .set_times(FileTimes::new().set_modified(mtime))?;
 
     Ok(())
 }
 
 /// Restore the original Cargo.toml file
-fn restore_cargo_toml(package_path: PathBuf) -> Result<(), anyhow::Error> {
+fn restore_cargo_toml(package_path: &Path) -> Result<(), anyhow::Error> {
     if std::fs::exists(windows_safe_path(&package_path.join("Cargo.toml_original")))? {
         if std::fs::exists(windows_safe_path(&package_path.join("Cargo.toml")))? {
             std::fs::remove_file(windows_safe_path(&package_path.join("Cargo.toml")))?;
@@ -767,12 +809,7 @@ pub fn build_documentation_index(
             let meta = generate_documentation_meta_for_package(*package, &chips, &version_label)?;
 
             // Render the template to HTML and write it out to the desired path:
-            let html = render_template(&resources_path, "package_index.html.somni", {
-                let mut env = Env::new();
-                env.value("package", package.to_string().replace('-', "_"))
-                    .value("metadata", Iter(meta));
-                env
-            })?;
+            let html = render_package_index(&resources_path, *package, meta)?;
             let path = version_path.join("index.html");
             fs::write(&path, html).context("Failed to write index.html")?;
             log::info!("Created {}", path.display());
@@ -810,6 +847,26 @@ pub fn build_documentation_index(
     log::info!("Created {}", path.display());
 
     Ok(())
+}
+
+fn render_package_index(
+    resources_path: &Path,
+    package: Package,
+    meta: Vec<Meta>,
+) -> Result<String> {
+    let peripheral_support = if package == Package::EspHal {
+        crate::metadata::peripheral_support_html()
+    } else {
+        ""
+    };
+
+    render_template(resources_path, "package_index.html.somni", {
+        let mut env = Env::new();
+        env.value("package", package.to_string().replace('-', "_"))
+            .value("metadata", Iter(meta))
+            .value("peripheral_support", peripheral_support);
+        env
+    })
 }
 
 fn generate_documentation_meta_for_package(
@@ -1003,7 +1060,7 @@ fn render_template(resources: &Path, template: &str, env: Env) -> Result<String>
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::{fs, path::Path};
 
     use somni_expr::somni_struct;
     use somni_template::{Env, Iter, TemplateTypes};
@@ -1015,8 +1072,11 @@ mod tests {
         highest_eligible_version,
         is_eligible_docs_version,
         latest_redirect_base,
+        latest_redirect_fallback,
         latest_redirect_html,
+        pre_process_cargo_toml,
         render_template,
+        restore_cargo_toml,
         should_write_latest_redirect,
     };
 
@@ -1034,6 +1094,46 @@ mod tests {
             manifest.insert_version(*v);
         }
         manifest
+    }
+
+    #[test]
+    fn processed_manifest_preserves_original_mtime() {
+        let temp = tempfile::tempdir().unwrap();
+        let package_path = temp.path().join("package");
+        fs::create_dir(&package_path).unwrap();
+
+        let original = "#DOC_IF has(\"wifi_driver_supported\")\n## Wi-Fi\n#DOC_ENDIF\n";
+        fs::write(package_path.join("Cargo.toml"), original).unwrap();
+        let original_mtime = fs::metadata(package_path.join("Cargo.toml"))
+            .unwrap()
+            .modified()
+            .unwrap();
+
+        // Simulate an interrupted run on a Wi-Fi chip followed by a non-Wi-Fi chip without an
+        // explicit restore in between.
+        pre_process_cargo_toml(Some(crate::Chip::Esp32c6), &package_path).unwrap();
+        assert_eq!(
+            fs::read_to_string(package_path.join("Cargo.toml")).unwrap(),
+            "## Wi-Fi\n"
+        );
+
+        pre_process_cargo_toml(Some(crate::Chip::Esp32h2), &package_path).unwrap();
+        let processed_mtime = fs::metadata(package_path.join("Cargo.toml"))
+            .unwrap()
+            .modified()
+            .unwrap();
+
+        assert_eq!(original_mtime, processed_mtime);
+        assert_eq!(
+            fs::read_to_string(package_path.join("Cargo.toml")).unwrap(),
+            "# Wi-Fi\n"
+        );
+
+        restore_cargo_toml(&package_path).unwrap();
+        assert_eq!(
+            fs::read_to_string(package_path.join("Cargo.toml")).unwrap(),
+            original
+        );
     }
 
     #[test]
@@ -1145,28 +1245,46 @@ mod tests {
     #[test]
     fn latest_redirect_base_paths() {
         let v = semver::Version::parse("2.1.0").unwrap();
+        // The base is always the version root; deep-link remainders appended by
+        // the redirect page already include the chip or crate directory.
+        assert_eq!(latest_redirect_base(&v), "../2.1.0/");
+    }
+
+    #[test]
+    fn latest_redirect_fallback_paths() {
+        // Packages with device-specific docs generate an index at the version root.
+        assert_eq!(latest_redirect_fallback(&crate::Package::EspHal), "");
+        // Other packages have no version-root index; land on the crate's index.
         assert_eq!(
-            latest_redirect_base(&crate::Package::EspHal, &v),
-            "../2.1.0/"
-        );
-        assert_eq!(
-            latest_redirect_base(&crate::Package::EspAlloc, &v),
-            "../2.1.0/esp_alloc/"
+            latest_redirect_fallback(&crate::Package::EspAlloc),
+            "esp_alloc/index.html"
         );
     }
 
     /// Small integration check for the redirect template.
     #[test]
-    fn latest_redirect_html_matches_latest_redirect_base() {
+    fn latest_redirect_html_matches_base_and_fallback() {
         let ws = workspace();
         let ver = semver::Version::parse("1.0.0").unwrap();
-        let pkg = crate::Package::EspHal;
 
-        let html = latest_redirect_html(ws, &pkg, &ver).unwrap();
-        let base = latest_redirect_base(&pkg, &ver);
+        for (pkg, fallback) in [
+            (crate::Package::EspHal, ""),
+            (crate::Package::EspAlloc, "esp_alloc/index.html"),
+        ] {
+            let html = latest_redirect_html(ws, &pkg, &ver).unwrap();
+            let base = latest_redirect_base(&ver);
 
-        assert!(html.contains(&format!("var base = \"{base}\"")));
-        assert!(html.contains(&format!("content=\"0; url={base}\"")));
+            assert!(html.contains(&format!("var base = \"{base}\"")));
+            assert!(html.contains(&format!("var fallback = \"{fallback}\"")));
+            assert!(html.contains(&format!("content=\"0; url={base}{fallback}\"")));
+
+            // URL fragments (`#method.foo`) never reach nginx, but browsers
+            // re-attach them to the 301 target, so the redirect page must carry
+            // `location.hash` over to the final destination explicitly.
+            assert!(html.contains("var hash = location.hash;"));
+            assert!(html.contains("location.replace(base + pathFromQuery + hash)"));
+            assert!(html.contains("location.replace(base + fallback + hash)"));
+        }
     }
 
     /// The version select box is embedded in a page full of braces, so make sure the
@@ -1208,13 +1326,8 @@ mod tests {
         )
         .unwrap();
 
-        let html = render_template(&ws.join("resources"), "package_index.html.somni", {
-            let mut env = Env::new();
-            env.value("package", "esp_hal")
-                .value("metadata", Iter(meta));
-            env
-        })
-        .unwrap();
+        let html = super::render_package_index(&ws.join("resources"), crate::Package::EspHal, meta)
+            .unwrap();
 
         assert!(
             html.contains("<title>esp_hal Documentation</title>"),
@@ -1232,6 +1345,10 @@ mod tests {
             html.contains("<span class=\"crate-version\">1.0.0</span>"),
             "{html}"
         );
+        assert!(
+            html.contains(r#"<details class="peri-matrix" id="peripheral-support">"#),
+            "{html}"
+        );
     }
 
     #[test]
@@ -1243,15 +1360,10 @@ mod tests {
         )
         .unwrap();
 
-        let html = render_template(
+        let html = super::render_package_index(
             &workspace().join("resources"),
-            "package_index.html.somni",
-            {
-                let mut env = Env::new();
-                env.value("package", "esp_hal")
-                    .value("metadata", Iter(meta));
-                env
-            },
+            crate::Package::EspHal,
+            meta,
         )
         .unwrap();
 
@@ -1259,6 +1371,25 @@ mod tests {
             html.contains("<span class=\"crate-version\">main</span>"),
             "{html}"
         );
+    }
+
+    #[test]
+    fn package_index_omits_peripheral_matrix_for_other_packages() {
+        let meta = generate_documentation_meta_for_package(
+            crate::Package::EspRadio,
+            &[crate::Chip::Esp32c6],
+            "main",
+        )
+        .unwrap();
+
+        let html = super::render_package_index(
+            &workspace().join("resources"),
+            crate::Package::EspRadio,
+            meta,
+        )
+        .unwrap();
+
+        assert!(!html.contains(r#"id="peripheral-support""#), "{html}");
     }
 
     #[test]
@@ -1301,6 +1432,10 @@ mod tests {
             "{html}"
         );
         assert!(html.contains("<code>esp-hal</code>"), "{html}");
+        assert!(
+            html.contains(r#"<a href="esp-hal/main/index.html#peripheral-support">Peripheral Support Matrix</a>"#),
+            "{html}"
+        );
     }
 
     #[test]

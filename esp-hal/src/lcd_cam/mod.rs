@@ -7,6 +7,9 @@
 
 use core::marker::PhantomData;
 
+use enumset::{EnumSet, EnumSetType};
+use esp_sync::RawMutex;
+
 use crate::{
     Async,
     Blocking,
@@ -21,6 +24,7 @@ use crate::{
 
 pub mod cam;
 pub mod lcd;
+pub(crate) mod ll;
 
 /// DMA TX channel trait for LCD (I8080, DPI) peripherals.
 ///
@@ -103,8 +107,7 @@ impl<'d> LcdCam<'d, Blocking> {
 
     /// Registers an interrupt handler for the LCD_CAM peripheral.
     ///
-    /// Note that this will replace any previously registered interrupt
-    /// handlers.
+    /// Replaces any previously registered interrupt handlers.
     #[instability::unstable]
     pub fn set_interrupt_handler(&mut self, handler: InterruptHandler) {
         for core in crate::system::Cpu::other() {
@@ -142,7 +145,7 @@ pub enum BitOrder {
     /// Do not change bit order.
     #[default]
     Native   = 0,
-    /// Invert bit order.
+    /// Inverts bit order.
     Inverted = 1,
 }
 
@@ -153,47 +156,135 @@ pub enum ByteOrder {
     /// Do not change byte order.
     #[default]
     Native   = 0,
-    /// Invert byte order.
+    /// Inverts byte order.
     Inverted = 1,
 }
 
 pub(crate) static LCD_DONE_WAKER: AtomicWaker = AtomicWaker::new();
+pub(crate) static LCD_VSYNC_WAKER: AtomicWaker = AtomicWaker::new();
+static INT_ENA_LOCK: RawMutex = RawMutex::new();
 
 #[handler]
 fn interrupt_handler() {
     // TODO: this is a shared interrupt with Camera and here we ignore that!
-    if Instance::is_lcd_done_set() {
+    let status = LCD_CAM::regs().lc_dma_int_st().read();
+    if status.lcd_trans_done_int_st().bit_is_set() {
         Instance::unlisten_lcd_done();
-        LCD_DONE_WAKER.wake()
+        LCD_DONE_WAKER.wake();
+    }
+    if status.lcd_vsync_int_st().bit_is_set() {
+        Instance::unlisten(LcdCamInterrupt::LcdVsync.into());
+        LCD_VSYNC_WAKER.wake();
     }
 }
 
 pub(crate) struct Instance;
 
-// NOTE: the LCD_CAM interrupt registers are shared between LCD and Camera and
-// this is only implemented for the LCD side, when the Camera is implemented a
-// CriticalSection will be needed to protect these shared registers.
+/// The interrupt sources of the LCD_CAM DMA interrupt registers.
+///
+/// This type is `pub(crate)` today. If the Camera driver ever needs its own
+/// listen API, it can be promoted to a public `LcdCamInterrupt` without
+/// renaming.
+#[derive(Debug, EnumSetType)]
+pub(crate) enum LcdCamInterrupt {
+    /// The LCD has started outputting a new frame.
+    LcdVsync,
+
+    /// A DMA transfer to the LCD has finished.
+    LcdTransDone,
+
+    /// The camera has received a VSYNC pulse.
+    CamVsync,
+
+    /// The camera has received an HSYNC pulse.
+    CamHs,
+}
+
+// LCD and Camera share the interrupt registers. Serialize INT_ENA updates
+// across cores and interrupt contexts.
 impl Instance {
-    fn enable_listenlcd_done(en: bool) {
-        LCD_CAM::regs()
-            .lc_dma_int_ena()
-            .modify(|_, w| w.lcd_trans_done_int_ena().bit(en));
+    fn enable_listen(sources: EnumSet<LcdCamInterrupt>, en: bool) {
+        INT_ENA_LOCK.lock(|| {
+            LCD_CAM::regs().lc_dma_int_ena().modify(|_, w| {
+                for source in sources {
+                    match source {
+                        LcdCamInterrupt::LcdVsync => {
+                            w.lcd_vsync_int_ena().bit(en);
+                        }
+                        LcdCamInterrupt::LcdTransDone => {
+                            w.lcd_trans_done_int_ena().bit(en);
+                        }
+                        LcdCamInterrupt::CamVsync => {
+                            w.cam_vsync_int_ena().bit(en);
+                        }
+                        LcdCamInterrupt::CamHs => {
+                            w.cam_hs_int_ena().bit(en);
+                        }
+                    }
+                }
+                w
+            });
+        });
+    }
+
+    pub(crate) fn listen(sources: EnumSet<LcdCamInterrupt>) {
+        Self::enable_listen(sources, true);
+    }
+
+    pub(crate) fn unlisten(sources: EnumSet<LcdCamInterrupt>) {
+        Self::enable_listen(sources, false);
+    }
+
+    pub(crate) fn interrupts() -> EnumSet<LcdCamInterrupt> {
+        let raw = LCD_CAM::regs().lc_dma_int_raw().read();
+        let mut sources = EnumSet::new();
+        if raw.lcd_vsync_int_raw().bit() {
+            sources.insert(LcdCamInterrupt::LcdVsync);
+        }
+        if raw.lcd_trans_done_int_raw().bit() {
+            sources.insert(LcdCamInterrupt::LcdTransDone);
+        }
+        if raw.cam_vsync_int_raw().bit() {
+            sources.insert(LcdCamInterrupt::CamVsync);
+        }
+        if raw.cam_hs_int_raw().bit() {
+            sources.insert(LcdCamInterrupt::CamHs);
+        }
+        sources
+    }
+
+    pub(crate) fn clear_interrupts(sources: EnumSet<LcdCamInterrupt>) {
+        LCD_CAM::regs().lc_dma_int_clr().write(|w| {
+            for source in sources {
+                match source {
+                    LcdCamInterrupt::LcdVsync => {
+                        w.lcd_vsync_int_clr().set_bit();
+                    }
+                    LcdCamInterrupt::LcdTransDone => {
+                        w.lcd_trans_done_int_clr().set_bit();
+                    }
+                    LcdCamInterrupt::CamVsync => {
+                        w.cam_vsync_int_clr().set_bit();
+                    }
+                    LcdCamInterrupt::CamHs => {
+                        w.cam_hs_int_clr().set_bit();
+                    }
+                }
+            }
+            w
+        });
     }
 
     pub(crate) fn listen_lcd_done() {
-        Self::enable_listenlcd_done(true);
+        Self::listen(LcdCamInterrupt::LcdTransDone.into());
     }
 
     pub(crate) fn unlisten_lcd_done() {
-        Self::enable_listenlcd_done(false);
+        Self::unlisten(LcdCamInterrupt::LcdTransDone.into());
     }
 
     pub(crate) fn is_lcd_done_set() -> bool {
-        LCD_CAM::regs()
-            .lc_dma_int_raw()
-            .read()
-            .lcd_trans_done_int_raw()
-            .bit()
+        Self::interrupts().contains(LcdCamInterrupt::LcdTransDone)
     }
 }
 pub(crate) struct ClockDivider {
@@ -223,7 +314,7 @@ impl ClockDivider {
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum ClockError {
-    /// Desired frequency was too low for the dividers to divide to
+    /// Desired frequency was too low for the dividers to divide to.
     FrequencyTooLow,
 }
 
